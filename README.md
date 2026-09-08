@@ -97,8 +97,39 @@ kubectl rollout restart daemonset/promtail -n monitoring
 # 7. ArgoCD（GitOps）
 kubectl create namespace argocd
 kubectl apply --server-side=true --force-conflicts -n argocd -f argocd-install.yaml
-kubectl apply -f 06-gitops/demo-app.yaml
+kubectl apply -f 06-gitops/root-app.yaml
 ```
+
+### 目录分工：演进过程 vs 最终状态
+
+`00` ~ `05` 是**逐步演进**的过程，适合照着学。但同一份资源在演进中会被后面的文件
+反复覆盖（比如 `prometheus-config` 在 01/02/03 里各有一份，`promtail-config` 在
+05 里两份），**直接交给 ArgoCD 会造成同一资源被多处管理** —— 两个控制器互相覆盖，
+比 HPA 与 GitOps 打架还严重。
+
+所以收敛出一份最终状态供 GitOps 消费：
+
+```
+04-demo-app/   业务服务（Deployment + Service + HPA + Ingress）
+10-platform/   监控/告警/日志的最终状态，每个资源只保留最后一次修改的版本
+06-gitops/
+  ├── root-app.yaml         根 Application，只管下面这些 Application
+  └── apps/
+      ├── platform-app.yaml   → 指向 10-platform
+      └── demo-app.yaml       → 指向 04-demo-app
+```
+
+**从零重建整套环境只要三步**（k3s 装好之后）：
+
+```shell
+kubectl create namespace argocd
+kubectl apply --server-side=true --force-conflicts -n argocd -f argocd-install.yaml
+kubectl apply -f 06-gitops/root-app.yaml
+```
+
+根 Application 会自动创建 `platform` 和 `demo-app` 两个子 Application，
+它们再各自同步自己负责的目录 —— 这就是 **App-of-Apps 模式**。
+新增组件只需往 `apps/` 里加一个文件，根应用自动发现。
 
 ### ArgoCD 说明
 
