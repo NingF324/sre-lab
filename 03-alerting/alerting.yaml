@@ -1,0 +1,304 @@
+# 第 3 步：告警体系（Alertmanager + 告警规则）
+# 组件：告警规则 ConfigMap + Alertmanager Config/Deployment/Service + Prometheus 挂载规则并指向 Alertmanager
+# 端口：Alertmanager NodePort 30093（需防火墙放行）
+# 部署：kubectl apply -f alerting.yaml
+#
+# 规则设计说明（面试常考）：
+#   NodeMemoryHigh / NodeCPUHigh    -> for: 5m，避免抖动误报
+#   NodeDiskWillFillIn4Hours        -> 用 predict_linear 做趋势预测，而非阈值（SRE 的正确做法）
+#   ContainerRestartingTooOften     -> 无 kube-state-metrics 时用 cAdvisor 的 start_time 变化次数判断
+#   TargetDown                      -> up==0，抓取目标失联
+#   Watchdog                        -> 恒真告警，用来验证整条告警链路是否通
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: monitoring
+data:
+  alerts.yml: |
+    groups:
+      - name: node.rules
+        rules:
+          - alert: NodeMemoryHigh
+            expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: node memory usage is high
+              description: "{{ $labels.instance }} memory usage is {{ printf \"%.1f\" $value }}% for 5m"
+
+          - alert: NodeCPUHigh
+            expr: avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100 < 20
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: node cpu usage is high
+              description: "{{ $labels.instance }} idle cpu is only {{ printf \"%.1f\" $value }}% for 5m"
+
+          - alert: NodeDiskWillFillIn4Hours
+            expr: predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}[1h], 4 * 3600) < 0
+            for: 10m
+            labels:
+              severity: critical
+            annotations:
+              summary: node disk will fill in 4 hours
+              description: "{{ $labels.instance }} mountpoint {{ $labels.mountpoint }} will be full within 4h"
+
+      - name: pod.rules
+        rules:
+          - alert: ContainerRestartingTooOften
+            expr: changes(container_start_time_seconds{container!="",namespace!="kube-system"}[10m]) > 2
+            for: 0m
+            labels:
+              severity: warning
+            annotations:
+              summary: container is restarting too often
+              description: "{{ $labels.namespace }}/{{ $labels.pod }} restarted more than 2 times in 10m"
+
+          - alert: TargetDown
+            expr: up == 0
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: scrape target is down
+              description: "{{ $labels.job }} / {{ $labels.instance }} is down for 2m"
+
+          - alert: Watchdog
+            expr: vector(1)
+            for: 0m
+            labels:
+              severity: none
+            annotations:
+              summary: alerting pipeline heartbeat
+              description: "This alert always fires. It proves the alerting pipeline works."
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+data:
+  alertmanager.yml: |
+    global:
+      resolve_timeout: 5m
+
+    route:
+      receiver: default
+      group_by: ['alertname', 'severity']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 3h
+      routes:
+        - matchers:
+            - severity="critical"
+          receiver: default
+          group_wait: 10s
+          repeat_interval: 1h
+
+    receivers:
+      - name: default
+      # 学习环境先留空：告警只在 Alertmanager UI 查看，不发到任何地方。
+      # 想接钉钉时改成：
+      #   - name: default
+      #     webhook_configs:
+      #       - url: 'https://oapi.dingtalk.com/robot/send?access_token=xxxx'
+      #         send_resolved: true
+
+    inhibit_rules:
+      - source_matchers: ['severity="critical"']
+        target_matchers: ['severity="warning"']
+        equal: ['alertname']
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: ['alertmanager:9093']
+
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+
+    scrape_configs:
+      - job_name: prometheus
+        static_configs:
+          - targets: [localhost:9090]
+
+      - job_name: node-exporter
+        static_configs:
+          - targets: [node-exporter:9100]
+
+      - job_name: kubernetes-nodes
+        scheme: https
+        tls_config:
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+
+      - job_name: kubernetes-cadvisor
+        scheme: https
+        tls_config:
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __metrics_path__
+            replacement: /metrics/cadvisor
+
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.54.1
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=7d
+            - --web.enable-lifecycle
+          ports:
+            - containerPort: 9090
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 768Mi
+              cpu: 500m
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: rules
+              mountPath: /etc/prometheus/rules
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: rules
+          configMap:
+            name: prometheus-rules
+        - name: data
+          emptyDir: {}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+    spec:
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.27.0
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+          ports:
+            - containerPort: 9093
+          resources:
+            requests:
+              memory: 64Mi
+              cpu: 50m
+            limits:
+              memory: 256Mi
+              cpu: 200m
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alertmanager
+            - name: data
+              mountPath: /alertmanager
+      volumes:
+        - name: config
+          configMap:
+            name: alertmanager-config
+        - name: data
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: monitoring
+spec:
+  type: NodePort
+  selector:
+    app: alertmanager
+  ports:
+    - port: 9093
+      targetPort: 9093
+      nodePort: 30093

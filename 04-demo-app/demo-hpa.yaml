@@ -1,0 +1,120 @@
+# 第 4 步：练手业务服务 + HPA 自动扩缩容
+# 目的：让监控有东西可看、让告警能被亲手打响（光看不动手的告警学不会）
+#
+# 组件与生产意义：
+#   Deployment php-apache  一个会烧 CPU 的 HTTP 服务（K8s 官方 HPA 示例镜像）
+#   Service                给 Pod 一个稳定的集群内访问入口（Pod IP 会变，Service 不会）
+#   HPA (autoscaling/v2)   按 CPU 使用率自动扩副本，生产里是应对流量峰值的第一道自动化手段
+#   Ingress                traefik 接管七层路由，生产里是外部流量统一入口（后面 Istio 会接管这一层）
+#
+# 关键设计：
+#   - requests 必须写：HPA 的 CPU 利用率 = 实际用量 / requests，不写 requests 百分比无从计算
+#   - requests 与 limits 分开：requests 保证调度下限，limits 防单个 Pod 吃光整机
+#   - behavior 单独配：扩容要快（0s 稳定窗），缩容要慢（300s 稳定窗），防抖动
+#
+# 部署：kubectl apply -f demo-hpa.yaml
+# 注意：镜像走阿里云 google_containers 镜像仓库（国内可达）；
+#       若拉取失败改 registry.aliyuncs.com/google_containers/hpa-example:latest
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: php-apache
+  namespace: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: php-apache
+  template:
+    metadata:
+      labels:
+        app: php-apache
+    # 注意：不要加 prometheus.io/scrape 注解 —— hpa-example 没有 /metrics 端点，
+    # 加了 Prometheus 会去抓 /metrics 得到 404，up==0 触发 TargetDown 误告警。
+    spec:
+      containers:
+        - name: php-apache
+          image: registry.cn-hangzhou.aliyuncs.com/google_containers/hpa-example:latest
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 200m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: php-apache
+  namespace: demo
+spec:
+  selector:
+    app: php-apache
+  ports:
+    - port: 80
+      targetPort: 80
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: php-apache
+  namespace: demo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: php-apache
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: php-apache
+  namespace: demo
+spec:
+  rules:
+    - host: php.demo.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: php-apache
+                port:
+                  number: 80

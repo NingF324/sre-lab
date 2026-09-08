@@ -1,0 +1,53 @@
+# Promtail 采集修复：K8s 服务发现 0 目标 -> 改用静态路径采集
+#
+# 背景：role: pod 的 kubernetes_sd_configs 在本环境静默返回 0 个目标
+#       （宿主机日志在、hostPath 挂载正常、Promtail 无报错，但 /targets 显示 0/0 ready）
+#
+# 这个 ConfigMap 换成：
+#   __path__: /var/log/pods/*/*/*.log  直接用通配符扫全部容器日志，不依赖服务发现
+#   再用 regex 从文件路径反解出 namespace / pod / container 三个标签
+#
+# 取舍：静态方案拿不到 Pod 自身的 label（如 app=xxx），生产正经做法仍是 kubernetes_sd_configs；
+#       此方案胜在链路短、可预测、便于排障，适合单机与快速验证。
+#
+# 部署：
+#   kubectl apply -f promtail-fix.yaml
+#   kubectl rollout restart daemonset/promtail -n monitoring
+# 验证：
+#   kubectl exec -n monitoring deploy/loki -- sh -c 'wget -qO- http://localhost:3100/loki/api/v1/labels'
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promtail-config
+  namespace: monitoring
+data:
+  promtail.yaml: |
+    server:
+      http_listen_port: 9080
+      grpc_listen_port: 0
+
+    positions:
+      filename: /tmp/positions.yaml
+
+    clients:
+      - url: http://loki:3100/loki/api/v1/push
+
+    scrape_configs:
+      - job_name: container-logs
+        static_configs:
+          - targets:
+              - localhost
+            labels:
+              job: container-logs
+              __path__: /var/log/pods/*/*/*.log
+        pipeline_stages:
+          - cri: {}
+          - regex:
+              source: filename
+              expression: ^/var/log/pods/(?P<namespace>[^_]+)_(?P<pod>[^_]+)_(?P<uid>[^/]+)/(?P<container>[^/]+)/.*\.log$
+          - labels:
+              namespace:
+              pod:
+              container:
