@@ -1,0 +1,50 @@
+# ArgoCD Application：让集群自动同步 Git 仓库里的 04-demo-app
+#
+# GitOps 的核心转变：
+#   以前是人敲 kubectl apply（命令式）
+#   现在是改 Git 仓库，集群自己把状态对齐到 Git（声明式）
+#   Git 成为唯一事实来源（single source of truth）
+#
+# 关键设计：
+#   1. automated.selfHeal: true  —— 有人手工改了集群，ArgoCD 会改回 Git 里的样子
+#   2. automated.prune: false    —— Git 里删掉的资源不会自动从集群删除，防止误删
+#   3. ignoreDifferences 忽略 Deployment 的 spec.replicas
+#      —— 因为副本数由 HPA 控制。不忽略的话 ArgoCD 会认为是"偏离"并反复改回去，
+#         和 HPA 打架。这是 GitOps 与自动扩缩容共存的标准做法。
+#
+# 部署（ArgoCD 装好之后）：
+#   kubectl apply -f demo-app.yaml
+# 验证：
+#   kubectl get application -n argocd
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-app
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/NingF324/sre-lab.git
+    targetRevision: master
+    path: 04-demo-app
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: demo
+
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      name: php-apache
+      jsonPointers:
+        - /spec/replicas
