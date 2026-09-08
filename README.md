@@ -1,10 +1,12 @@
 # sre-lab —— 单节点 SRE 可观测性实验环境
 
-一套跑在 **4 核 4G** 云服务器上的完整 SRE 练手环境：k3s + Prometheus + Grafana + Alertmanager + HPA + Loki。
+一套跑在 **4 核 4G** 云服务器上的完整 SRE 练手环境：
+**可观测性三件套（指标 / 告警 / 日志）+ HPA 自动扩缩容 + GitOps 自动同步**。
 所有组件从零手写 YAML 部署，不用 Helm Chart，目的是**把每个组件的行为和取舍都摸清楚**。
 
 > 硬件：腾讯云轻量 4C4G / 40G / OpenCloudOS 9.6（RHEL 系，对齐生产栈）
 > 集群：k3s v1.36.4+k3s1，单节点
+> 仓库：<https://github.com/NingF324/sre-lab>
 
 ---
 
@@ -43,6 +45,25 @@
 
 三者凑齐才是完整的可观测性。只有指标能发现故障，只有日志能定位原因。
 
+### GitOps 层
+
+```
+开发者 ──git push──▶ GitHub/Gitee 仓库
+                          │
+                          │ ArgoCD 每 3 分钟轮询（或 webhook 推送）
+                          ▼
+                   ArgoCD 对比 Git 声明 vs 集群实际状态
+                          │
+                          ├─ 有差异 → 自动同步（selfHeal）
+                          └─ 一致   → 什么都不做
+                          │
+                          ▼
+                  k8s 集群（Deployment / Service / HPA / Ingress）
+```
+
+**Git 是唯一事实来源。** 任何对集群的直接修改都会被 controller 按 Git 的声明改回去 ——
+这条机制在本次实践中以一次真实事故的形式验证过（见踩坑 13）。
+
 ---
 
 ## 部署顺序
@@ -72,7 +93,30 @@ kubectl apply -f 04-demo-app/demo-hpa.yaml
 kubectl apply -f 05-logging/loki-stack.yaml
 kubectl apply -f 05-logging/promtail-fix.yaml
 kubectl rollout restart daemonset/promtail -n monitoring
+
+# 7. ArgoCD（GitOps）
+kubectl create namespace argocd
+kubectl apply --server-side=true --force-conflicts -n argocd -f argocd-install.yaml
+kubectl apply -f 06-gitops/demo-app.yaml
 ```
+
+### ArgoCD 说明
+
+- 安装清单不在这里维护，从官方仓库取：
+  `https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml`
+- **`--server-side=true` 是必需的**，原因见踩坑 14
+- 4C4G 机器上建议关掉不需要的组件：
+  ```shell
+  kubectl scale deploy argocd-dex-server argocd-notifications-controller \
+    argocd-applicationset-controller -n argocd --replicas=0
+  ```
+- 取初始密码：
+  ```shell
+  kubectl -n argocd get secret argocd-initial-admin-secret \
+    -o jsonpath="{.data.password}" | base64 -d
+  ```
+- 暴露 UI：`kubectl patch svc argocd-server -n argocd --type=json \
+  -p='[{"op":"replace","path":"/spec/type","value":"NodePort"}]'`
 
 > Grafana 数据源用 ConfigMap provisioning 注入，改完必须重启：
 > `kubectl rollout restart deployment/grafana -n monitoring`
@@ -102,10 +146,13 @@ kubectl get pods -A | grep -v Completed
 kubectl get hpa -n demo
 kubectl top pod -n demo
 
-# Loki 收到日志没有（关键！返回 data 数组才算通）
-kubectl exec -n monitoring deploy/loki -- \
-  sh -c 'wget -qO- http://localhost:3100/loki/api/v1/labels'
+# ArgoCD 同步状态
+kubectl get application -n argocd
+kubectl describe application demo-app -n argocd | tail -30
 ```
+
+> `describe` 的 Events 是排查同步问题最有效的手段，它记录了每一次
+> `Synced → OutOfSync → Unknown` 的完整时间线。
 
 ### 亲手把告警打响
 
@@ -225,6 +272,73 @@ kubectl exec -n monitoring deploy/prometheus -- \
 `grafana/promtail` 里没有 `wget`/`curl`，exec 进去做不了网络调试。
 要查它的 `/targets`，得从集群内另一个 busybox Pod 访问它的 Pod IP。
 
+### 13. GitOps 接管后，集群上的手工修复会被抹掉（配置漂移）
+
+**本次实践中真实踩过的一次事故**：
+
+| 时间 | 动作 | 集群 | Git |
+|---|---|---|---|
+| Day N | 阿里云镜像源拉不动，`kubectl set image` 换成可用源 | 正确镜像 | **仍是坏镜像** |
+| Day N+4 | ArgoCD 接管，`selfHeal: true` 开始工作 | — | — |
+| Day N+4 | push 一次改动，ArgoCD 同步整个目录 | **被改回坏镜像 → ImagePullBackOff** | 仍是坏镜像 |
+
+**你在集群上改的任何东西，只要没写回 Git，都会被 controller 按 Git 的声明改回去 ——
+哪怕错的是 Git 自己。** 修复办法只有一个：把正确的状态写进 Git。
+
+这也是生产上"禁止直接 kubectl 操作生产环境、一切变更走 PR"的技术根源。
+
+配套的另一个必要设计：
+
+```yaml
+ignoreDifferences:
+  - group: apps
+    kind: Deployment
+    name: php-apache
+    jsonPointers: [ /spec/replicas ]
+```
+
+副本数由 HPA 控制，不忽略的话 ArgoCD 会认为集群"偏离"Git 并反复改回去，
+**两个控制器打架，副本数疯狂抖动**。这是 GitOps 与自动扩缩容共存的标准解法。
+
+### 14. ArgoCD 大 CRD 装不上：`annotations: Too long`
+
+```
+The CustomResourceDefinition "applicationsets.argoproj.io" is invalid:
+metadata.annotations: Too long: may not be more than 262144 bytes
+```
+
+根因：`kubectl apply` 会把整份资源原文塞进 `kubectl.kubernetes.io/last-applied-configuration`
+注解，这个 CRD 超过 K8s 256KB 的注解上限。
+
+解法是 **Server-Side Apply**，它把字段归属记在服务端的 `managedFields`，不写那个注解：
+
+```shell
+kubectl apply --server-side=true -n argocd -f argocd-install.yaml
+```
+
+如果之前已经用客户端 apply 过，会报字段所有权冲突（`conflict with "kubectl-client-side-apply"`），
+加 `--force-conflicts` 强制接管即可。
+
+### 15. ArgoCD 同步有延迟：默认 3 分钟轮询
+
+未配 webhook 时，push 之后最长要等 3 分钟才同步。
+生产环境必须给仓库配 webhook 指向 `/api/webhook`，实现 push 即触发的秒级同步。
+
+### 16. `SYNC STATUS = Unknown`：repo-server 缓存卡死
+
+表象：仓库可达（`git ls-remote` 通）、内存正常、Pod 无重启，但 ArgoCD 算不出同步状态。
+
+排查链：
+
+```
+网络断了？     → ls-remote 通，排除
+资源不够？     → 全家只用 223Mi 零重启，排除
+进程崩了？     → AGE 稳定无重启，排除
+剩下就是仓库缓存/解析 ← 确认
+```
+
+解法：`kubectl rollout restart deploy/argocd-repo-server -n argocd` 清空缓存即恢复。
+
 ---
 
 ## 已知限制
@@ -243,6 +357,9 @@ kubectl exec -n monitoring deploy/prometheus -- \
 - [ ] 日志告警（Loki Ruler：ERROR 日志速率超阈值告警）
 - [ ] 持久化改造（PVC 替代 emptyDir）
 - [ ] kube-state-metrics（补齐 Deployment 维度指标）
+- [ ] Webhook 改造（ArgoCD 秒级同步）
+- [ ] App-of-Apps 模式（用一个根 Application 管理全部子 Application）
+- [x] ~~ArgoCD GitOps~~（已完成：demo-app 已由 Git 自动同步）
 - [ ] Istio 灰度发布
 - [ ] ArgoCD GitOps（本仓库直接作为 ArgoCD 的源）
 - [ ] AIOps：aiops-anomaly 异常检测 / sre-ai-agent 告警自动分析
