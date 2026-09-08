@@ -42,7 +42,7 @@ spec:
     spec:
       containers:
         - name: php-apache
-          image: registry.cn-hangzhou.aliyuncs.com/google_containers/hpa-example:latest
+          image: mirrorgooglecontainers/hpa-example:latest
           ports:
             - containerPort: 80
           resources:
