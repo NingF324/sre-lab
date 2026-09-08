@@ -1,0 +1,20 @@
+# 统一换行符，避免 shell 脚本在 Linux 上跑不起来
+#
+# 为什么必须管：
+#   Windows 默认 core.autocrlf=true，Git 检出时会把 LF 转成 CRLF。
+#   YAML 到 Linux 上还算能扛，但 **.sh 脚本带 CRLF 会直接报错**：
+#     bash: ./k3s-init-oc9.sh: /bin/bash^M: bad interpreter: No such file or directory
+#   这个 ^M 就是 CR，肉眼看不见，排查起来很折磨人。
+#
+# eol=lf 强制仓库和工作区都用 Unix 换行符。
+
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+
+*.png binary
+*.jpg binary
+*.pdf binary
