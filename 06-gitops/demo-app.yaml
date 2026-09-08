@@ -27,7 +27,10 @@ spec:
   project: default
 
   source:
-    repoURL: https://github.com/NingF324/sre-lab.git
+    # 用 Gitee 镜像而不是 GitHub：repo-server 在国内服务器上访问 github.com
+    # 会间歇性超时（context deadline exceeded），导致同步失败。
+    # 本地已配置 Git 双推，两个仓库内容始终一致。
+    repoURL: https://gitee.com/ningf321/sre-lab.git
     targetRevision: master
     path: 04-demo-app
 
