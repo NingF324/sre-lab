@@ -1,0 +1,36 @@
+# 根 Application（App-of-Apps 模式）
+#
+# 这个 Application 本身不管业务资源，它只管理 06-gitops/apps 目录下
+# 那堆 Application CR。Apply 它一个，下面所有子 Application 会被自动创建，
+# 再由各自去同步自己负责的目录。
+#
+# 为什么用这个模式：
+#   1. 新增一个组件 = 往 apps/ 里加一个文件，根应用自动发现，不用改别的地方
+#   2. 分层清晰：根管"有哪些应用"，子管"这个应用有什么资源"
+#   3. 从零重建环境只需要 apply 这一个文件
+#
+# 部署：kubectl apply -f root-app.yaml
+# 之后：kubectl get application -n argocd -w
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://gitee.com/ningf321/sre-lab.git
+    targetRevision: master
+    path: 06-gitops/apps
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true

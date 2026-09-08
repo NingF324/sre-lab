@@ -1,0 +1,32 @@
+# 监控平台 Application：把 10-platform 目录整体交给 ArgoCD
+#
+# 与 demo-app 的分工：
+#   platform  -> 监控/告警/日志（基础设施层）
+#   demo-app  -> 业务服务（应用层）
+# 分成两个 Application 是生产常见做法：基础设施和业务变更节奏不同，
+# 分开管理可以各自控制同步策略、各自回滚，互不影响。
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://gitee.com/ningf321/sre-lab.git
+    targetRevision: master
+    path: 10-platform
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

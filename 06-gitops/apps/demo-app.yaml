@@ -1,0 +1,39 @@
+# 业务服务 Application：把 04-demo-app 目录交给 ArgoCD
+#
+# 关键设计 —— ignoreDifferences：
+#   Deployment 的 spec.replicas 由 HPA 控制，不忽略的话 ArgoCD 会认定集群
+#   "偏离 Git" 并反复改回去，与 HPA 打架导致副本数抖动。
+#   这是 GitOps 与自动扩缩容共存的标准解法。
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-app
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    # 用 Gitee 镜像：repo-server 在国内访问 github.com 会间歇性超时
+    repoURL: https://gitee.com/ningf321/sre-lab.git
+    targetRevision: master
+    path: 04-demo-app
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: demo
+
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      name: php-apache
+      jsonPointers:
+        - /spec/replicas

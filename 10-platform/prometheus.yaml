@@ -1,0 +1,272 @@
+# 收敛后的 Prometheus 最终状态（RBAC + 服务发现 + 告警规则）
+#
+# 合并来源：
+#   ServiceAccount / ClusterRole / ClusterRoleBinding  <- 02-discovery
+#   prometheus-config（含 k8s SD + alerting 段 + rule_files） <- 03-alerting（最终版）
+#   prometheus-rules / prometheus Deployment（含 rules 挂载）  <- 03-alerting
+
+---
+# RBAC：Prometheus 要 list/watch Pod、节点和 kubelet 指标，
+# 没有这个 ClusterRole，服务发现拿不到任何目标。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - nodes/proxy
+      - nodes/metrics
+      - services
+      - endpoints
+      - pods
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources:
+      - configmaps
+    verbs: [get]
+  - nonResourceURLs: [/metrics, /metrics/cadvisor]
+    verbs: [get]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: monitoring
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: ['alertmanager:9093']
+
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+
+    scrape_configs:
+      - job_name: prometheus
+        static_configs:
+          - targets: [localhost:9090]
+
+      - job_name: node-exporter
+        static_configs:
+          - targets: [node-exporter:9100]
+
+      # kubelet 自身指标，走 https + ServiceAccount token
+      - job_name: kubernetes-nodes
+        scheme: https
+        tls_config:
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+
+      # 容器级指标（等同于 kubectl top pod 的数据源）
+      - job_name: kubernetes-cadvisor
+        scheme: https
+        tls_config:
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __metrics_path__
+            replacement: /metrics/cadvisor
+
+      # 按注解抓取业务 Pod（opt-in），避免全量噪音
+      # 注意：只对有 /metrics 端点的应用加 prometheus.io/scrape 注解，
+      # 否则 Prometheus 抓到 404 -> up==0 -> 触发 TargetDown 误告警
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: monitoring
+data:
+  alerts.yml: |
+    groups:
+      - name: node.rules
+        rules:
+          - alert: NodeMemoryHigh
+            expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: node memory usage is high
+              description: "{{ $labels.instance }} memory usage is {{ printf \"%.1f\" $value }}% for 5m"
+
+          - alert: NodeCPUHigh
+            expr: avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100 < 20
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: node cpu usage is high
+              description: "{{ $labels.instance }} idle cpu is only {{ printf \"%.1f\" $value }}% for 5m"
+
+          # 磁盘不用固定阈值，用线性回归预测 4 小时后会不会满
+          - alert: NodeDiskWillFillIn4Hours
+            expr: predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}[1h], 4 * 3600) < 0
+            for: 10m
+            labels:
+              severity: critical
+            annotations:
+              summary: node disk will fill in 4 hours
+              description: "{{ $labels.instance }} mountpoint {{ $labels.mountpoint }} will be full within 4h"
+
+      - name: pod.rules
+        rules:
+          # 没有 kube-state-metrics 时，用 cAdvisor 的启动时间变化判断重启
+          - alert: ContainerRestartingTooOften
+            expr: changes(container_start_time_seconds{container!="",namespace!="kube-system"}[10m]) > 2
+            for: 0m
+            labels:
+              severity: warning
+            annotations:
+              summary: container is restarting too often
+              description: "{{ $labels.namespace }}/{{ $labels.pod }} restarted more than 2 times in 10m"
+
+          - alert: TargetDown
+            expr: up == 0
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: scrape target is down
+              description: "{{ $labels.job }} / {{ $labels.instance }} is down for 2m"
+
+          # 恒真告警，专门用来验证告警链路是否通畅
+          - alert: Watchdog
+            expr: vector(1)
+            for: 0m
+            labels:
+              severity: none
+            annotations:
+              summary: alerting pipeline heartbeat
+              description: "This alert always fires. It proves the alerting pipeline works."
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.54.1
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=7d
+            # 允许 POST /-/reload 热加载配置，改 ConfigMap 后不必重启 Pod
+            - --web.enable-lifecycle
+          ports:
+            - containerPort: 9090
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 768Mi
+              cpu: 500m
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: rules
+              mountPath: /etc/prometheus/rules
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: rules
+          configMap:
+            name: prometheus-rules
+        - name: data
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  type: NodePort
+  selector:
+    app: prometheus
+  ports:
+    - port: 9090
+      targetPort: 9090
+      nodePort: 30090
