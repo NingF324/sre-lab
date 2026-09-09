@@ -66,8 +66,13 @@ spec:
           args:
             - --config.file=/etc/alertmanager/alertmanager.yml
             - --storage.path=/alertmanager
-            # 支持 POST /-/reload，ConfigMap 更新后热加载，不必重启 Pod
-            - --web.enable-lifecycle
+            # 坑：这里千万别加 --web.enable-lifecycle！
+            # 那是 Prometheus 的专属参数，Alertmanager 不认识，加了会直接启动失败：
+            #   alertmanager: error: unknown long flag '--web.enable-lifecycle'
+            # 症状很有迷惑性：Pod 起不来 -> kubectl exec 报 container not found，
+            # 而 Prometheus 的 /api/v1/alertmanagers 仍然把 9093 列为 active，
+            # 看起来"配置是对的"，其实一条告警都发不出去。
+            # Alertmanager 本来就监听配置文件变化自动重载，不需要任何开关。
           ports:
             - containerPort: 9093
           resources:

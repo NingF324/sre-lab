@@ -79,6 +79,14 @@ data:
         static_configs:
           - targets: [node-exporter:9100]
 
+      # Alertmanager 自身：让"告警链路"也被监控起来
+      # 关键指标 alertmanager_notifications_failed_total（webhook 投递失败数）
+      # 没有这个 job，Alertmanager 挂了在 Grafana 上完全看不出来，
+      # 只能靠"告警一直没来"这种被动感知——本次事故就是这么被拖住的
+      - job_name: alertmanager
+        static_configs:
+          - targets: [alertmanager:9093]
+
       # kubelet 自身指标，走 https + ServiceAccount token
       - job_name: kubernetes-nodes
         scheme: https
@@ -169,6 +177,21 @@ data:
             annotations:
               summary: node disk will fill in 4 hours
               description: "{{ $labels.instance }} mountpoint {{ $labels.mountpoint }} will be full within 4h"
+
+      # 元监控：监控系统自己挂了，也得有人知道
+      # 这条有点"悖论"——Alertmanager 挂了它自然发不出去，
+      # 但它会出现在 Prometheus /alerts 和 Grafana 上，
+      # 是"告警为什么没来"这件事的第一个线索
+      - name: meta.rules
+        rules:
+          - alert: AlertmanagerDown
+            expr: up{job="alertmanager"} == 0
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: alertmanager is down
+              description: "Alertmanager 已不可达 2 分钟，整条告警通知链路中断"
 
       - name: pod.rules
         rules:

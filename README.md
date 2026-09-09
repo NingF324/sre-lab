@@ -370,6 +370,59 @@ kubectl apply --server-side=true -n argocd -f argocd-install.yaml
 
 解法：`kubectl rollout restart deploy/argocd-repo-server -n argocd` 清空缓存即恢复。
 
+### 17. `--web.enable-lifecycle` 是 Prometheus 专属参数，Alertmanager 加了会启动失败
+
+最隐蔽的一类事故：**配置看着全对，服务其实根本没起来。**
+
+```yaml
+args:
+  - --config.file=/etc/alertmanager/alertmanager.yml
+  - --storage.path=/alertmanager
+  - --web.enable-lifecycle   # ← 错！Alertmanager 不认这个参数
+```
+
+报错：`alertmanager: error: unknown long flag '--web.enable-lifecycle', try --help`
+
+为什么难查——三层假象叠在一起：
+
+| 你看到的现象 | 真实含义 |
+|---|---|
+| Prometheus `/api/v1/alertmanagers` 返回 9093 `active` | 只说明**服务发现到了**，不代表连通健康 |
+| Prometheus `/alerts` 里 NodeCPUHigh 正常 FIRING | 只说明**规则求值通过**，不代表通知已发出 |
+| `kubectl exec` 报 `container not found` | 容器压根没起来，不是"容器里没这个命令" |
+
+正确认知：Alertmanager **天生监听配置文件变化自动重载**，不需要任何开关；
+只有 Prometheus 需要 `--web.enable-lifecycle` 才支持 `POST /-/reload`。
+
+### 18. 告警链路四段论：排查必须逐段二分
+
+告警从产生到人看见，是四段**互相独立**的链路，任一段断了现象完全一样（"页面没告警"）：
+
+```
+1 规则求值 → 2 通知推送 → 3 分组路由 → 4 富化落库
+Prometheus    → Alertmanager  → webhook   → 你的页面
+```
+
+对应的验证手段：
+
+| 段 | 怎么证明它通没通 |
+|---|---|
+| 1 | `wget -qO- http://localhost:9090/api/v1/rules` 看 state |
+| 2 | `wget -qO- http://localhost:9090/api/v1/alertmanagers` 看 activeAlertmanagers |
+| 3 | `wget -qO- 'http://localhost:9093/api/v2/alerts?active=true'` 看 AM 收到没 |
+| 4 | 接收端自己的接入日志（`[webhook] N alert(s)`） |
+
+生产上还要给每段配可观测证据：`prometheus_notifications_errors_total`、
+`alertmanager_notifications_failed_total`、接收端埋点。否则故障时只能靠
+"告警怎么还没来"这种被动感知，MTTR 会非常难看。
+
+另外两个反直觉的点：
+
+- **`group_wait` / `repeat_interval` 只决定"什么时候发"，不决定"发不发"**。
+  第一通知一定会发，所以"页面没有"不能用"还在 repeat 冷却"来解释。
+- **Watchdog 恒真告警的价值是端到端心跳**，不是报警。
+  建议把它的 `repeat_interval` 单独调短，专门当链路探针用。
+
 ---
 
 ## 已知限制
