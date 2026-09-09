@@ -32,11 +32,11 @@ data:
 
     receivers:
       - name: default
-      # 想接钉钉时改成：
-      #   - name: default
-      #     webhook_configs:
-      #       - url: 'https://oapi.dingtalk.com/robot/send?access_token=xxxx'
-      #         send_resolved: true
+        # 告警富化服务：每条告警推给它，自动查指标+日志生成诊断卡片
+        webhook_configs:
+          - url: http://alert-enricher.monitoring.svc.cluster.local:8080/webhook
+            send_resolved: true
+      # 想再接钉钉，加第二个 webhook_config 指向钉钉机器人即可
 
     # critical 抑制同名 warning，避免同一个问题刷两条
     inhibit_rules:
@@ -66,6 +66,8 @@ spec:
           args:
             - --config.file=/etc/alertmanager/alertmanager.yml
             - --storage.path=/alertmanager
+            # 支持 POST /-/reload，ConfigMap 更新后热加载，不必重启 Pod
+            - --web.enable-lifecycle
           ports:
             - containerPort: 9093
           resources:

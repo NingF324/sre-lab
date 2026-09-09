@@ -1,0 +1,28 @@
+# AIOps Application：指向 20-aiops 目录
+#
+# 注意：这个文件加进 06-gitops/apps/ 后，不需要任何额外操作——
+# root Application 轮询时发现 apps/ 下多了文件，会自动创建这个子 Application。
+# 这就是 App-of-Apps 的扩展方式：加组件 = 加文件。
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: aiops
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://gitee.com/ningf321/sre-lab.git
+    targetRevision: master
+    path: 20-aiops
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true

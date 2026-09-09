@@ -1,0 +1,256 @@
+# 告警富化服务（alert-enricher）：sre-ai-agent 的第一阶段
+#
+# 作用：接收 Alertmanager 的 webhook，为每条告警自动附加上下文——
+#   1. 查 Prometheus：相关指标的真实数值
+#   2. 查 Loki：该 Pod 最近的日志
+#   3. 附处理建议（规则引擎；后续可替换为 LLM 调用）
+#   4. 生成「诊断卡片」存档，并提供网页查看
+#
+# 设计决策：
+#   - 纯 Python 标准库（http.server / urllib / json），零 pip 依赖
+#     -> 不用构建镜像，代码放 ConfigMap 挂载进 python:3.11-slim 直接跑
+#   - 这是 sre-ai-agent 的地基：把"查指标、查日志、给建议"三件事抽成函数，
+#     之后接 LLM 时只需替换 generate_hints() 的实现
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alert-enricher-code
+  namespace: monitoring
+data:
+  app.py: |
+    #!/usr/bin/env python3
+    # -*- coding: utf-8 -*-
+    import json, time, urllib.request, urllib.parse
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    PROM = "http://prometheus.monitoring.svc.cluster.local:9090"
+    LOKI = "http://loki.monitoring.svc.cluster.local:3100"
+    DATA = "/data/alerts.jsonl"
+    LOCK = __import__("threading").Lock()
+
+    def get_json(url, timeout=6):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            return {"status": "error", "_error": str(e)}
+
+    def prom_query(expr):
+        u = PROM + "/api/v1/query?" + urllib.parse.urlencode({"query": expr})
+        d = get_json(u)
+        if d.get("status") != "success":
+            return None
+        return d["data"]["result"]
+
+    def loki_logs(selector, minutes=15, limit=12):
+        end = int(time.time() * 1e9)
+        start = end - minutes * 60 * 10**9
+        u = LOKI + "/loki/api/v1/query_range?" + urllib.parse.urlencode({
+            "query": selector, "limit": str(limit),
+            "start": str(start), "end": str(end)})
+        d = get_json(u)
+        if d.get("status") != "success":
+            return []
+        out = []
+        for stream in d["data"]["result"]:
+            pod = stream["stream"].get("pod", "?")
+            for _ts, line in stream["values"]:
+                out.append("[%s] %s" % (pod, line[:180]))
+        return out[:limit]
+
+    def fmt_series(result, value_key):
+        out = {}
+        for m in result or []:
+            k = ",".join(("%s=%s" % (kk, vv)) for kk, vv in sorted(m["metric"].items())[:2]) or "value"
+            out[k] = round(float(m["value"][1]), 2)
+        return out
+
+    def generate_hints(alertname, labels):
+        # 规则引擎版建议；接 LLM 后替换这个函数即可
+        h = []
+        if alertname == "NodeCPUHigh":
+            h.append("节点 CPU 打满。先 kubectl top pod 找出吃 CPU 的容器；")
+            h.append("如果是压测/批任务导致属预期，打 Silence 并注明原因。")
+        elif alertname == "NodeMemoryHigh":
+            h.append("节点内存吃紧。警惕 OOMKill：kubectl get pods -A 看 RESTARTS。")
+        elif alertname == "NodeDiskWillFillIn4Hours":
+            h.append("磁盘预测告警：du 定位大文件，清理日志或扩容，不要等真满了。")
+        elif alertname == "ContainerRestartingTooOften":
+            h.append("容器频繁重启：kubectl logs --previous 看崩溃前的输出，多为 OOMKill 或启动失败。")
+        elif alertname == "TargetDown":
+            h.append("抓取目标失联：先 curl 目标的 /metrics 看返回——404=没暴露指标，refused=没起来。")
+        elif alertname == "Watchdog":
+            h.append("心跳告警，恒真。看到它说明整条告警链路是通的。")
+        else:
+            h.append("无内置建议，请人工评估。")
+        return h
+
+    def enrich(alert):
+        labels = alert.get("labels", {})
+        ann = alert.get("annotations", {})
+        name = labels.get("alertname", "?")
+        pod, ns = labels.get("pod"), labels.get("namespace")
+        inst = labels.get("instance")
+        out = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "alertname": name,
+            "status": alert.get("status", "firing"),
+            "severity": labels.get("severity", "-"),
+            "summary": ann.get("summary", ""),
+            "description": ann.get("description", ""),
+            "labels": labels,
+            "metrics": {},
+            "logs": [],
+            "hints": generate_hints(name, labels),
+        }
+        try:
+            if name == "NodeCPUHigh" and inst:
+                r = prom_query('100 - avg by(instance)(rate(node_cpu_seconds_total{mode="idle"}[5m]))*100')
+                out["metrics"]["node_cpu_busy_pct"] = fmt_series(r, None)
+            if name == "NodeMemoryHigh":
+                r = prom_query('(1 - node_memory_MemAvailable_bytes/node_memory_MemTotal_bytes)*100')
+                out["metrics"]["mem_used_pct"] = fmt_series(r, None)
+            if pod and ns:
+                cpu = prom_query('sum by(pod)(rate(container_cpu_usage_seconds_total{namespace="%s",pod="%s",container!=""}[5m]))*1000' % (ns, pod))
+                out["metrics"]["pod_cpu_mcores"] = fmt_series(cpu, None)
+                mem = prom_query('container_memory_working_set_bytes{namespace="%s",pod="%s",container!=""}' % (ns, pod))
+                out["metrics"]["pod_mem_bytes"] = fmt_series(mem, None)
+            if ns:
+                sel = '{namespace="%s"%s}' % (ns, ', pod=~"%s.*"' % pod if pod else "")
+                out["logs"] = loki_logs(sel)
+        except Exception as e:
+            out["hints"].append("enrich error: %s" % e)
+        return out
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, code, body, ctype="text/html; charset=utf-8"):
+            data = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self):
+            if self.path != "/webhook":
+                return self._send(404, "not found", "text/plain")
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                payload = json.loads(self.rfile.read(n).decode("utf-8"))
+            except Exception as e:
+                return self._send(400, "bad json: %s" % e, "text/plain")
+            records = []
+            for a in payload.get("alerts", []):
+                try:
+                    records.append(enrich(a))
+                except Exception as e:
+                    records.append({"time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    "alertname": "?", "error": str(e)})
+            with LOCK:
+                with open(DATA, "a", encoding="utf-8") as f:
+                    for r in records:
+                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            print("[webhook] %d alert(s), status=%s" % (len(records), payload.get("status")), flush=True)
+            self._send(200, "ok", "text/plain")
+
+        def do_GET(self):
+            if self.path == "/healthz":
+                return self._send(200, "ok", "text/plain")
+            if self.path != "/":
+                return self._send(404, "not found", "text/plain")
+            rows = []
+            try:
+                with open(DATA, encoding="utf-8") as f:
+                    lines = f.readlines()
+            except FileNotFoundError:
+                lines = []
+            for line in reversed(lines[-40:]):
+                try:
+                    a = json.loads(line)
+                except Exception:
+                    continue
+                color = "#dc2626" if a.get("severity") == "critical" else "#d97706"
+                m = "".join("<li><code>%s</code> = %s</li>" % (html_escape(k), html_escape(str(v))) for k, v in a.get("metrics", {}).items())
+                lg = "".join("<li style='font-family:monospace;font-size:12px'>%s</li>" % html_escape(x) for x in a.get("logs", [])[:6])
+                ht = "".join("<li>%s</li>" % html_escape(x) for x in a.get("hints", []))
+                rows.append("""
+                <div style="border:1px solid #e5e8ee;border-left:4px solid %s;border-radius:8px;padding:12px 16px;margin:10px 0;background:#fff">
+                <b>%s</b> <span style="color:%s">[%s]</span> <small>%s</small><br>
+                <small>%s</small>
+                <b>指标：</b><ul style="margin:4px 0 4px 18px">%s</ul>
+                <b>最近日志：</b><ul style="margin:4px 0 4px 18px">%s</ul>
+                <b>建议：</b><ul style="margin:4px 0 4px 18px;color:#1d4ed8">%s</ul>
+                </div>""" % (color, a.get("alertname", "?"), color, a.get("status", ""), a.get("time", ""), a.get("summary", ""), m, lg, ht))
+            self._send(200, PAGE_HEADER + ("".join(rows) or "<p>还没有收到告警。触发一条试试。</p>"))
+
+    def html_escape(s):
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    PAGE_HEADER = """<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+    <title>告警诊断卡片</title></head>
+    <body style="font-family:Microsoft YaHei,sans-serif;background:#f6f7f9;margin:0;padding:24px;max-width:900px;margin:0 auto">
+    <h2 style="margin:8px 0">告警诊断卡片（AI 第一阶段：规则富化）</h2>
+    <p style="color:#8a93a3;font-size:13px">来源：Alertmanager webhook → 自动查 Prometheus 指标 + Loki 日志 → 附加排查建议</p>"""
+
+    if __name__ == "__main__":
+        srv = ThreadingHTTPServer(("0.0.0.0", 8080), Handler)
+        print("alert-enricher listening on :8080", flush=True)
+        srv.serve_forever()
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alert-enricher
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alert-enricher
+  template:
+    metadata:
+      labels:
+        app: alert-enricher
+    spec:
+      containers:
+        - name: enricher
+          image: python:3.11-slim
+          command: ["python", "/app/app.py"]
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              memory: 48Mi
+              cpu: 50m
+            limits:
+              memory: 128Mi
+              cpu: 200m
+          volumeMounts:
+            - name: code
+              mountPath: /app
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: code
+          configMap:
+            name: alert-enricher-code
+        - name: data
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alert-enricher
+  namespace: monitoring
+spec:
+  type: NodePort
+  selector:
+    app: alert-enricher
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30095
