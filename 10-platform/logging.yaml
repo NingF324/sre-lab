@@ -65,6 +65,9 @@ metadata:
   namespace: monitoring
 spec:
   replicas: 1
+  # 同 Prometheus：RWO 卷 + 单副本用 Recreate
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: loki
@@ -100,8 +103,11 @@ spec:
         - name: config
           configMap:
             name: loki-config
+        # chunk + 索引持久化，否则重启后查不到任何历史日志
+        # （fsGroup: 10001 已配好，PVC 同样生效）
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: loki-data
 
 ---
 apiVersion: v1
@@ -115,6 +121,21 @@ spec:
   ports:
     - port: 3100
       targetPort: 3100
+
+---
+# 日志 chunk + boltdb 索引。retention 72h，给 5Gi。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: loki-data
+  namespace: monitoring
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
 
 ---
 apiVersion: v1
@@ -167,7 +188,11 @@ data:
       grpc_listen_port: 0
 
     positions:
-      filename: /tmp/positions.yaml
+      # 位置文件记录"每个日志文件读到哪一行了"，必须持久化：
+      # 放 /tmp 的话 Promtail 一重启就失忆，
+      # 结果要么漏采（从文件末尾重新开始）、要么重复采（从头再来一遍）。
+      # 用宿主机目录存 —— DaemonSet 每个节点一份，天然适合 hostPath。
+      filename: /var/lib/promtail/positions.yaml
 
     clients:
       - url: http://loki:3100/loki/api/v1/push
@@ -231,7 +256,14 @@ spec:
             - name: containers-logs
               mountPath: /var/log/containers
               readOnly: true
+            - name: positions
+              mountPath: /var/lib/promtail
       volumes:
+        - name: positions
+          hostPath:
+            path: /var/lib/promtail
+            # 目录不存在时自动创建，避免首次部署 Pod 起不来
+            type: DirectoryOrCreate
         - name: config
           configMap:
             name: promtail-config

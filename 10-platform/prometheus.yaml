@@ -232,6 +232,9 @@ metadata:
   namespace: monitoring
 spec:
   replicas: 1
+  # RWO 卷 + 单副本：必须先停后起，否则新 Pod 卡在等旧 Pod 释放卷
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: prometheus
@@ -244,6 +247,10 @@ spec:
         prometheus.io/port: "9090"
     spec:
       serviceAccountName: prometheus
+      # prometheus 官方镜像以 uid 65534（nobody）运行，
+      # 卷必须让这个 uid 可写，否则起不来
+      securityContext:
+        fsGroup: 65534
       containers:
         - name: prometheus
           image: prom/prometheus:v2.54.1
@@ -276,8 +283,10 @@ spec:
         - name: rules
           configMap:
             name: prometheus-rules
+        # TSDB 持久化：否则 Pod 一重启，历史指标和压测曲线全没了
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: prometheus-data
 
 ---
 apiVersion: v1
@@ -293,3 +302,20 @@ spec:
     - port: 9090
       targetPort: 9090
       nodePort: 30090
+
+---
+# TSDB 存储。retention 7d + cAdvisor 指标量不小，给 8Gi。
+# 注意：k3s 的 local-path 默认 allowVolumeExpansion=false，
+# 卷大小不能在线扩，所以初次申请要留足余量，真满了只能重建 PVC 再导数据。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-data
+  namespace: monitoring
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 8Gi

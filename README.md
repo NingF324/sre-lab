@@ -446,14 +446,55 @@ RWO 卷同一时刻只允许挂载到一个节点。默认 `RollingUpdate` 在�
 单副本 + RWO 的正确姿势是 `strategy: type: Recreate`（先停后起），
 代价是几秒中断——对内部工具完全可以接受。
 
+### 21. 非 root 容器挂 PVC 要配 `fsGroup`，否则写不进去
+
+`emptyDir` 默认权限宽松，很多容器"刚好能跑"；换成 PVC 后属主变成卷的属主，
+非 root 容器就会 `Permission denied` 起不来。
+
+| 镜像 | 运行 uid | 需要的 `securityContext` |
+|---|---|---|
+| prom/prometheus | 65534 (nobody) | `fsGroup: 65534` |
+| prom/alertmanager | 65534 (nobody) | `fsGroup: 65534` |
+| grafana/loki | 10001 | `fsGroup: 10001` |
+| grafana/grafana | 472 | `fsGroup: 472` |
+
+`fsGroup` 的作用是让 kubelet 把卷的属组改成指定 GID 并开组写权限——
+**这是有状态服务上 PVC 的标准动作，不是可选项。**
+
+### 22. Promtail 的位置文件不能放 `/tmp`
+
+`positions.filename` 记录"每个日志文件读到第几行"。放 `/tmp` 的话
+Promtail 一重启就失忆：要么从末尾开始（**漏采**），要么从头开始（**重复采**）。
+
+DaemonSet 每个节点一份，天然适合用 `hostPath`：
+
+```yaml
+positions:
+  filename: /var/lib/promtail/positions.yaml
+volumes:
+  - name: positions
+    hostPath:
+      path: /var/lib/promtail
+      type: DirectoryOrCreate   # 目录不存在时自动建，避免首次部署起不来
+```
+
 ---
 
 ## 已知限制
 
-- **监控/日志存储仍是 emptyDir**：Prometheus TSDB、Loki、Grafana 数据随 Pod 重启清零。
-  **alert-enricher 的诊断卡片已改用 PVC**（`storageClassName: local-path`），
-  重启不再丢——因为它是审计溯源数据，丢了等于事故没发生过。
-  其余组件要练持久化，把 `emptyDir: {}` 换成 PVC 即可（k3s 自带 local-path-provisioner）。
+- **存储已全面持久化**（PVC + k3s 自带 local-path provisioner）：
+
+  | 组件 | 卷 | 大小 | 存的是什么，丢了会怎样 |
+  |---|---|---|---|
+  | Prometheus | `prometheus-data` | 8Gi | TSDB。丢了历史曲线全没，压测复盘无从谈起 |
+  | Loki | `loki-data` | 5Gi | 日志 chunk + 索引。丢了查不到任何历史日志 |
+  | Grafana | `grafana-data` | 1Gi | 手建仪表盘、用户、API Key。丢了要重新导入 |
+  | Alertmanager | `alertmanager-data` | 1Gi | **Silence**。丢了静默失效，告警重新开始轰炸 |
+  | alert-enricher | `enricher-data` | 1Gi | 诊断卡片（审计溯源）。丢了等于事故没发生过 |
+  | Promtail | hostPath `/var/lib/promtail` | — | 读取位置。丢了要么漏采、要么重复采 |
+
+  ⚠️ **local-path 默认 `allowVolumeExpansion=false`，卷不能在线扩容**，
+  初次申请要留足余量，真满了只能重建 PVC 再导数据。生产应换云盘 CSI 并开启扩容。
 - **没有 kube-state-metrics**：Deployment/ReplicaSet 维度的指标拿不到，
   Pod 重启告警改用 `changes(container_start_time_seconds[10m]) > 2` 从 cAdvisor 侧实现。
 - **Promtail 用静态采集**：见踩坑 9。
@@ -464,7 +505,7 @@ RWO 卷同一时刻只允许挂载到一个节点。默认 `RollingUpdate` 在�
 ## 后续路线
 
 - [ ] 日志告警（Loki Ruler：ERROR 日志速率超阈值告警）
-- [ ] 持久化改造（PVC 替代 emptyDir）—— alert-enricher 已完成，Prometheus/Loki 待做
+- [x] ~~持久化改造（PVC 替代 emptyDir）~~（已完成：Prometheus / Loki / Grafana / Alertmanager / enricher 全部 PVC）
 - [ ] kube-state-metrics（补齐 Deployment 维度指标）
 - [ ] Webhook 改造（ArgoCD 秒级同步）
 - [ ] App-of-Apps 模式（用一个根 Application 管理全部子 Application）

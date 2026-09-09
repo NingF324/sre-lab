@@ -52,6 +52,8 @@ metadata:
   namespace: monitoring
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: alertmanager
@@ -60,6 +62,9 @@ spec:
       labels:
         app: alertmanager
     spec:
+      # alertmanager 镜像以 uid 65534（nobody）运行
+      securityContext:
+        fsGroup: 65534
       containers:
         - name: alertmanager
           image: prom/alertmanager:v0.27.0
@@ -91,8 +96,11 @@ spec:
         - name: config
           configMap:
             name: alertmanager-config
+        # 存的是 Silence 和通知状态。用 emptyDir 的话，
+        # 每次重启你手工设的 Silence 全丢，告警又开始狂轰滥炸
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: alertmanager-data
 
 ---
 apiVersion: v1
@@ -108,3 +116,18 @@ spec:
     - port: 9093
       targetPort: 9093
       nodePort: 30093
+
+---
+# Silence / 通知状态存储，量很小，1Gi 足够
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: alertmanager-data
+  namespace: monitoring
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi

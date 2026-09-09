@@ -47,6 +47,8 @@ metadata:
   namespace: monitoring
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: grafana
@@ -55,6 +57,9 @@ spec:
       labels:
         app: grafana
     spec:
+      # grafana 镜像以 uid 472 运行
+      securityContext:
+        fsGroup: 472
       containers:
         - name: grafana
           image: grafana/grafana:11.2.0
@@ -76,8 +81,11 @@ spec:
             - name: datasources
               mountPath: /etc/grafana/provisioning/datasources
       volumes:
+        # 持久化：手建的仪表盘、用户、API Key 都存在这里，
+        # 之前用 emptyDir 时 Grafana 一重启全没了（数据源靠 ConfigMap 能自愈，仪表盘不能）
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: grafana-data
         - name: datasources
           configMap:
             name: grafana-datasources
@@ -96,6 +104,21 @@ spec:
     - port: 3000
       targetPort: 3000
       nodePort: 30030
+
+---
+# Grafana 状态目录（sqlite + 仪表盘 + 插件）
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-data
+  namespace: monitoring
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
 
 ---
 # node-exporter 用 DaemonSet：每个节点都必须有一个，采集的是宿主机指标
