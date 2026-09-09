@@ -263,6 +263,12 @@ metadata:
   namespace: monitoring
 spec:
   replicas: 1
+  # Recreate 而不是默认 RollingUpdate：
+  # PVC 是 ReadWriteOnce，若先起新 Pod 再杀旧的，新 Pod 会卡在等卷释放。
+  # 单副本 + RWO 的组合，正确姿势就是"先停后起"。代价是几秒中断，
+  # 对这个内部诊断服务完全可以接受。
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: alert-enricher
@@ -304,8 +310,10 @@ spec:
         - name: code
           configMap:
             name: alert-enricher-code
+        # 持久化：诊断卡片是审计溯源数据，不能随 Pod 重建丢掉
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: enricher-data
 
 ---
 apiVersion: v1
@@ -321,3 +329,21 @@ spec:
     - port: 8080
       targetPort: 8080
       nodePort: 30095
+
+---
+# 诊断卡片的持久化存储。
+# k3s 自带 local-path-provisioner，storageClassName 用 local-path 即可，
+# 它会在节点上开一个本地目录当卷用——学习环境够用，
+# 生产要换成云盘 CSI（腾讯云 CBS / AWS EBS）并保证可迁移。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: enricher-data
+  namespace: monitoring
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi

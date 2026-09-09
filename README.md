@@ -423,12 +423,37 @@ Prometheus    → Alertmanager  → webhook   → 你的页面
 - **Watchdog 恒真告警的价值是端到端心跳**，不是报警。
   建议把它的 `repeat_interval` 单独调短，专门当链路探针用。
 
+### 19. `emptyDir` 的生命周期 = Pod 的生命周期
+
+`kubectl rollout restart` 看着只是"重启一下"，实际会：重建 Pod → emptyDir 清空 → 内存态丢失。
+
+```bash
+kubectl -n monitoring create secret generic deepseek-api --from-literal=api-key='sk-xxx'
+kubectl rollout restart deploy/alert-enricher -n monitoring
+# 结果：30095 页面空了。不是服务挂了，是历史卡片全没了。
+```
+
+**判断一个服务能不能随便重启，先看它是不是无状态的。** 有状态的部分
+（TSDB、日志 chunk、告警存档）必须 PVC 或外部对象存储。
+
+生产上 Prometheus 配 PVC + Thanos/Mimir 远程存储，就是同一个道理。
+
+### 20. `ReadWriteOnce` 的 PVC 别配默认的 RollingUpdate
+
+RWO 卷同一时刻只允许挂载到一个节点。默认 `RollingUpdate` 在单副本下是
+"先起新的、再杀旧的"，新 Pod 会卡在等旧 Pod 释放卷。
+
+单副本 + RWO 的正确姿势是 `strategy: type: Recreate`（先停后起），
+代价是几秒中断——对内部工具完全可以接受。
+
 ---
 
 ## 已知限制
 
-- **存储全用 emptyDir**：Pod 重启数据清零。学习环境够用，生产需换 PVC。
-  要练持久化，把 `emptyDir: {}` 换成 PVC + local-path-provisioner（k3s 自带）。
+- **监控/日志存储仍是 emptyDir**：Prometheus TSDB、Loki、Grafana 数据随 Pod 重启清零。
+  **alert-enricher 的诊断卡片已改用 PVC**（`storageClassName: local-path`），
+  重启不再丢——因为它是审计溯源数据，丢了等于事故没发生过。
+  其余组件要练持久化，把 `emptyDir: {}` 换成 PVC 即可（k3s 自带 local-path-provisioner）。
 - **没有 kube-state-metrics**：Deployment/ReplicaSet 维度的指标拿不到，
   Pod 重启告警改用 `changes(container_start_time_seconds[10m]) > 2` 从 cAdvisor 侧实现。
 - **Promtail 用静态采集**：见踩坑 9。
@@ -439,7 +464,7 @@ Prometheus    → Alertmanager  → webhook   → 你的页面
 ## 后续路线
 
 - [ ] 日志告警（Loki Ruler：ERROR 日志速率超阈值告警）
-- [ ] 持久化改造（PVC 替代 emptyDir）
+- [ ] 持久化改造（PVC 替代 emptyDir）—— alert-enricher 已完成，Prometheus/Loki 待做
 - [ ] kube-state-metrics（补齐 Deployment 维度指标）
 - [ ] Webhook 改造（ArgoCD 秒级同步）
 - [ ] App-of-Apps 模式（用一个根 Application 管理全部子 Application）
