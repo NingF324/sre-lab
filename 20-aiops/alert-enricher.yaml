@@ -22,13 +22,18 @@ data:
   app.py: |
     #!/usr/bin/env python3
     # -*- coding: utf-8 -*-
-    import json, time, urllib.request, urllib.parse
+    import json, time, os, urllib.request, urllib.parse
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     PROM = "http://prometheus.monitoring.svc.cluster.local:9090"
     LOKI = "http://loki.monitoring.svc.cluster.local:3100"
     DATA = "/data/alerts.jsonl"
     LOCK = __import__("threading").Lock()
+
+    # LLM 配置：API Key 从环境变量注入（K8s Secret），不写进代码、不进 Git
+    DEEPSEEK_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/chat/completions")
+    DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+    DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
     def get_json(url, timeout=6):
         try:
@@ -87,6 +92,39 @@ data:
             h.append("无内置建议，请人工评估。")
         return h
 
+    def llm_diagnose(ctx_text):
+        # 用 LLM 生成诊断。Key 为空或调用失败时返回原因，调用方回退到规则建议
+        if not DEEPSEEK_KEY:
+            return None
+        prompt = (
+            "你是资深 SRE。下面是一条来自 Kubernetes 监控的告警，以及自动采集到的指标和日志。\n"
+            "请给出中文诊断，严格按三段输出，不要寒暄和多余解释：\n"
+            "【可能原因】2-3 条，按概率从高到低\n"
+            "【排查步骤】3 步，每步给出可直接执行的命令\n"
+            "【是否需立即处理】是/否，附一句话理由\n\n"
+            + ctx_text
+        )
+        body = json.dumps({
+            "model": DEEPSEEK_MODEL,
+            "messages": [
+                {"role": "system", "content": "你是资深 SRE，回答简洁、可执行，不啰嗦。"},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 800,
+            "stream": False,
+        }).encode("utf-8")
+        req = urllib.request.Request(DEEPSEEK_URL, data=body, headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + DEEPSEEK_KEY,
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=45) as r:
+                d = json.loads(r.read().decode("utf-8"))
+            return d["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            return "LLM 调用失败：%s" % e
+
     def enrich(alert):
         labels = alert.get("labels", {})
         ann = alert.get("annotations", {})
@@ -122,6 +160,15 @@ data:
                 out["logs"] = loki_logs(sel)
         except Exception as e:
             out["hints"].append("enrich error: %s" % e)
+
+        # 只在真正 firing 且非心跳告警时调 LLM —— 控制 token 成本
+        if name != "Watchdog" and alert.get("status") == "firing":
+            ctx = ("告警：%s（severity=%s）\n描述：%s\n标签：%s\n指标：%s\n最近日志：\n%s" % (
+                name, out["severity"], out["description"],
+                json.dumps(labels, ensure_ascii=False),
+                json.dumps(out["metrics"], ensure_ascii=False),
+                "\n".join(out["logs"][:8]) or "(无)"))
+            out["llm"] = llm_diagnose(ctx)
         return out
 
     class Handler(BaseHTTPRequestHandler):
@@ -175,14 +222,23 @@ data:
                 m = "".join("<li><code>%s</code> = %s</li>" % (html_escape(k), html_escape(str(v))) for k, v in a.get("metrics", {}).items())
                 lg = "".join("<li style='font-family:monospace;font-size:12px'>%s</li>" % html_escape(x) for x in a.get("logs", [])[:6])
                 ht = "".join("<li>%s</li>" % html_escape(x) for x in a.get("hints", []))
+                llm = a.get("llm")
+                if llm:
+                    llm_block = ("<b>AI 诊断（DeepSeek）：</b>"
+                                 "<pre style='white-space:pre-wrap;background:#f8fafc;border:1px solid #e5e8ee;"
+                                 "border-radius:6px;padding:10px;margin:6px 0;font-size:13px'>%s</pre>"
+                                 % html_escape(llm))
+                else:
+                    llm_block = "<small style='color:#94a3b8'>AI 诊断：未启用（未配置 API Key 或非 firing 告警）</small>"
                 rows.append("""
                 <div style="border:1px solid #e5e8ee;border-left:4px solid %s;border-radius:8px;padding:12px 16px;margin:10px 0;background:#fff">
                 <b>%s</b> <span style="color:%s">[%s]</span> <small>%s</small><br>
                 <small>%s</small>
                 <b>指标：</b><ul style="margin:4px 0 4px 18px">%s</ul>
                 <b>最近日志：</b><ul style="margin:4px 0 4px 18px">%s</ul>
-                <b>建议：</b><ul style="margin:4px 0 4px 18px;color:#1d4ed8">%s</ul>
-                </div>""" % (color, a.get("alertname", "?"), color, a.get("status", ""), a.get("time", ""), a.get("summary", ""), m, lg, ht))
+                <b>规则建议：</b><ul style="margin:4px 0 4px 18px;color:#1d4ed8">%s</ul>
+                %s
+                </div>""" % (color, a.get("alertname", "?"), color, a.get("status", ""), a.get("time", ""), a.get("summary", ""), m, lg, ht, llm_block))
             self._send(200, PAGE_HEADER + ("".join(rows) or "<p>还没有收到告警。触发一条试试。</p>"))
 
     def html_escape(s):
@@ -221,13 +277,24 @@ spec:
           command: ["python", "/app/app.py"]
           ports:
             - containerPort: 8080
+          # API Key 从 Secret 注入，绝不写进 ConfigMap / Git
+          env:
+            - name: DEEPSEEK_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: deepseek-api
+                  key: api-key
+                  # optional=true：没有 Secret 时容器照常启动，自动回退到规则建议
+                  optional: true
+            - name: DEEPSEEK_MODEL
+              value: deepseek-chat
           resources:
             requests:
               memory: 48Mi
               cpu: 50m
             limits:
-              memory: 128Mi
-              cpu: 200m
+              memory: 192Mi
+              cpu: 300m
           volumeMounts:
             - name: code
               mountPath: /app
