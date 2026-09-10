@@ -1,0 +1,38 @@
+# 逃生舱：把根 Application 指回 Gitee 镜像
+#
+# 为什么要有这个文件：
+#   root Application 的源改成了 GitHub。万一跨境网络又抽风，
+#   ArgoCD 就拉不到 Git —— 而"修好它"这件事本身也需要读 Git，形成死循环。
+#
+#   root-app 是唯一一个手工 apply 的 Application，所以它天然是恢复入口：
+#   直接 apply 本文件，根应用切回 Gitee，下面所有子 Application 随之恢复。
+#
+# 用法（集群上执行，不依赖 ArgoCD）：
+#   kubectl apply -f root-app-gitee-fallback.yaml
+#
+# 注意：本文件的 metadata.name 故意也叫 root，apply 后会覆盖同名对象。
+# 恢复正常后，apply 回主版本即可：
+#   kubectl apply -f https://raw.githubusercontent.com/NingF324/sre-lab/master/06-gitops/root-app.yaml
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://gitee.com/ningf321/sre-lab.git
+    targetRevision: master
+    path: 06-gitops/apps
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true

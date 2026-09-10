@@ -478,6 +478,48 @@ volumes:
       type: DirectoryOrCreate   # 目录不存在时自动建，避免首次部署起不来
 ```
 
+### 23. ArgoCD 不支持 Gitee webhook —— 以及"改 `/etc/hosts`"为什么对 Pod 无效
+
+ArgoCD 原生支持的 Git webhook 只有：**GitHub、GitLab、Bitbucket、Bitbucket Server、
+Azure DevOps、Gogs**。Gitee 不在列表里，把 Gitee 的 push 事件直接打到
+`/api/webhook` 会被判为 `Unknown webhook event` 返回 400。
+
+网上常见的偏方是：**定时用境外 DNS 解析 GitHub 域名，写进宿主机 `/etc/hosts`**。
+这个思路对"自己 SSH 上服务器手动 clone"有帮助，但对 ArgoCD **有两处硬伤**：
+
+| 硬伤 | 说明 |
+|---|---|
+| 管不到 Pod | 容器里的 `/etc/hosts` 是 kubelet 单独生成并挂载的（`/var/lib/kubelet/pods/&lt;uid&gt;/etc-hosts`），**宿主机改了 Pod 感知不到**。而拉仓库的是 `argocd-repo-server` 这个 Pod |
+| 治标不治本 | 只修 DNS，修不了链路层丢包；IP 硬编码 + cron 更新，GitHub 一换 IP 就黑洞到下次定时 |
+
+**正确的排查顺序（分级处理）：**
+
+1. **先测 Pod 内连通性**——很多"不通"其实是想当然：
+   ```bash
+   kubectl run nettest --image=busybox:1.36 --restart=Never -- sh -c \
+     'timeout 20 wget -qO- https://api.github.com >/dev/null 2>&1 && echo OK || echo FAIL'
+   ```
+2. 若 DNS 解析到错 IP → **改 CoreDNS 的上游转发**（`forward . 1.1.1.1 8.8.8.8`）。
+   这才是那个偏方的正确版本：集群级生效、一处修改、无 cron、不会 IP 过期。
+3. 确实不通 → 才考虑 Gitee 拉代码 + 自建 webhook 转发层。
+
+**本次结论**：宿主机 GitHub 200（1.37s）、Pod 内 DNS 解析正常且 HTTPS 通 →
+直接切回 GitHub，白捡原生 webhook，一行转发代码都不用写。
+
+#### 逃生舱：Git 不可达时怎么救
+
+root Application 的源指向 GitHub。万一跨境网络又抽风，ArgoCD 拉不到 Git，
+而"修好它"本身又要读 Git —— 死循环。
+
+所以 **root-app 是唯一手工 apply 的 Application，它天然是恢复入口**：
+
+```bash
+kubectl apply -f 00-bootstrap/root-app-gitee-fallback.yaml   # 切回 Gitee
+```
+
+这个 fallback 文件独立于主链路，不需要 ArgoCD 能工作。
+**任何 GitOps 系统都应该保留一条不依赖自身的恢复路径**——这是设计纪律。
+
 ---
 
 ## 已知限制
@@ -507,7 +549,7 @@ volumes:
 - [ ] 日志告警（Loki Ruler：ERROR 日志速率超阈值告警）
 - [x] ~~持久化改造（PVC 替代 emptyDir）~~（已完成：Prometheus / Loki / Grafana / Alertmanager / enricher 全部 PVC）
 - [ ] kube-state-metrics（补齐 Deployment 维度指标）
-- [ ] Webhook 改造（ArgoCD 秒级同步）
+- [x] ~~Webhook 改造（ArgoCD 秒级同步）~~（已配置 `argocd-webhook` NodePort **30080**，待推送验证）
 - [ ] App-of-Apps 模式（用一个根 Application 管理全部子 Application）
 - [x] ~~ArgoCD GitOps~~（已完成：demo-app 已由 Git 自动同步）
 - [ ] Istio 灰度发布

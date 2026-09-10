@@ -1,0 +1,29 @@
+# ArgoCD 自身的辅助资源 Application：指向 07-argocd 目录
+#
+# 这里只放"ArgoCD 集群里我们自己加的配件"（目前是 webhook 的 NodePort Service），
+# 不包含 ArgoCD 的安装清单本身 —— 那部分是 bootstrap，用 00-bootstrap 的方式手工装。
+#
+# 放进 apps/ 后同样由 root Application 自动发现，无需额外操作。
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argocd-extras
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/NingF324/sre-lab.git
+    targetRevision: master
+    path: 07-argocd
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true

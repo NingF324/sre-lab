@@ -15,8 +15,10 @@ spec:
   project: default
 
   source:
-    # 用 Gitee 镜像：repo-server 在国内访问 github.com 会间歇性超时
-    repoURL: https://gitee.com/ningf321/sre-lab.git
+    # 2026-09-10 改回 GitHub：Pod 内实测可直连（见 README 第 23 条），
+    # 这样可以享受 ArgoCD 原生的 GitHub webhook，不必自建转发层。
+    # Gitee 仍保留为镜像（双推），仅作备用源，见 00-bootstrap/root-app-gitee-fallback.yaml
+    repoURL: https://github.com/NingF324/sre-lab.git
     targetRevision: master
     path: 04-demo-app
 
