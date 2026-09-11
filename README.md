@@ -520,6 +520,43 @@ kubectl apply -f 00-bootstrap/root-app-gitee-fallback.yaml   # 切回 Gitee
 这个 fallback 文件独立于主链路，不需要 ArgoCD 能工作。
 **任何 GitOps 系统都应该保留一条不依赖自身的恢复路径**——这是设计纪律。
 
+### 24. 连通性测试必须测"真实会走的那条路径"
+
+这是 2026-09-10 判断失误换来的教训，值得单独记一条。
+
+当时我测的是 `https://api.github.com`（一个小 HTTPS 请求，1.37s 就回来了），
+据此判定"服务器能直连 GitHub"，把 ArgoCD 的源切了过去。
+
+**第二天打脸**：`failed to list refs: Get "https://github.com/NingF324/sre-lab.git/info/refs?service=git-upload-pack": net/http: TLS handshake timeout`
+
+两次请求的区别：
+
+| | 我测的 | 实际走的 |
+|---|---|---|
+| 域名 | `api.github.com` | `github.com` |
+| 路径 | `/` | `/<repo>.git/info/refs?service=git-upload-pack` |
+| 数据量 | 几百字节 | 几十 KB+ |
+| 耗时 | 1.37s | 常超 30s |
+
+**跨境链路的问题往往只在"大流量 / 长连接"上暴露，小请求探测不出来。**
+
+正确的测试方法：
+
+```bash
+kubectl run nettest --image=busybox:1.36 --restart=Never -- sh -c '
+timeout 30 wget -qO- "https://github.com/NingF324/sre-lab.git/info/refs?service=git-upload-pack" >/dev/null 2>&1 \
+  && echo "GitHub git OK" || echo "GitHub git FAIL"
+timeout 20 wget -qO- "https://gitee.com/ningf321/sre-lab.git/info/refs?service=git-upload-pack" >/dev/null 2>&1 \
+  && echo "Gitee  git OK" || echo "Gitee  git FAIL"
+'
+```
+
+**并且要重复跑几次、不同时段跑**——单次成功不能作为"稳定"的证据。
+一次观测叫"碰巧"，多次观测才叫"结论"。
+
+结论：本环境（腾讯云上海）访问 GitHub 的 git 协议不稳定，
+**ArgoCD 的拉取源用 Gitee，GitHub 只作镜像和 webhook 来源**。
+
 ---
 
 ## 已知限制

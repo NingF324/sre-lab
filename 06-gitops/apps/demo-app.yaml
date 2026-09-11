@@ -15,10 +15,10 @@ spec:
   project: default
 
   source:
-    # 2026-09-10 改回 GitHub：Pod 内实测可直连（见 README 第 23 条），
-    # 这样可以享受 ArgoCD 原生的 GitHub webhook，不必自建转发层。
-    # Gitee 仍保留为镜像（双推），仅作备用源，见 00-bootstrap/root-app-gitee-fallback.yaml
-    repoURL: https://github.com/NingF324/sre-lab.git
+    # 拉取源用 Gitee：repo-server 访问 github.com 实测间歇性超时（见 README 第 24 条）。
+    # 2026-09-10 曾切到 GitHub 想用原生 webhook，2026-09-11 因 TLS handshake timeout 回退。
+    # 教训：连通性测试必须测"真实会走的那条路径"（git-upload-pack），不是随便挑一个域名。
+    repoURL: https://gitee.com/ningf321/sre-lab.git
     targetRevision: master
     path: 04-demo-app
 

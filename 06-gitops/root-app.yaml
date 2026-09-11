@@ -22,7 +22,7 @@ spec:
   project: default
 
   source:
-    repoURL: https://github.com/NingF324/sre-lab.git
+    repoURL: https://gitee.com/ningf321/sre-lab.git
     targetRevision: master
     path: 06-gitops/apps
 
