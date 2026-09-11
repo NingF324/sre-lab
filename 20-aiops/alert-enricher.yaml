@@ -322,13 +322,15 @@ metadata:
   name: alert-enricher
   namespace: monitoring
 spec:
-  type: NodePort
+  # ClusterIP：诊断卡片页面不对外暴露，走 SSH 隧道访问。
+  # 注意：它被 Alertmanager 通过集群内 DNS 调用（alert-enricher.monitoring.svc），
+  # 改成 ClusterIP 完全不影响那条链路 —— 集群内部调用本来就不走 NodePort。
+  type: ClusterIP
   selector:
     app: alert-enricher
   ports:
     - port: 8080
       targetPort: 8080
-      nodePort: 30095
 
 ---
 # 诊断卡片的持久化存储。

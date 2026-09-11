@@ -644,6 +644,59 @@ kubectl exec <pod> -- ls -la /app
 （ConfigMap、Secret、PVC、ServiceAccount、hostPath），
 **对象存在只是必要条件，不是充分条件**。凡是"资源建了但用不上"，先查引用链有没有断。
 
+### 27. 管理界面不该暴露在公网 —— Service 类型是安全边界
+
+搭环境时图省事，四个管理界面全用了 `NodePort`：
+
+| 端口 | 组件 | 密码 |
+|---|---|---|
+| 30030 | Grafana | **admin123** |
+| 30090 | Prometheus UI | 无认证 |
+| 30093 | Alertmanager UI | 无认证 |
+| 30095 | 告警诊断卡片 | 无认证 |
+
+**`NodePort` 的语义是"在每个节点的所有网卡上开一个端口"**——
+只要防火墙放行，它就是公网可达的。等于把四个管理界面挂在互联网上，
+其中一个还是弱口令。这是新手搭环境最常见的疏忽。
+
+**三种 Service 类型的语义要分清：**
+
+| 类型 | 可达范围 | 什么时候用 |
+|---|---|---|
+| `ClusterIP` | 只有集群内部 | **默认选它**。管理界面、内部 API |
+| `NodePort` | 每个节点的 30000-32767 端口 | 必须被外部主动访问，且没有 Ingress |
+| `LoadBalancer` | 云厂商给的公网/内网 LB | 生产对外服务 |
+
+**判断口诀：这个流量是"别人来敲我"还是"我自己去敲它"？**
+
+- **别人来敲我**（GitHub 推 webhook、用户访问网站）→ 必须暴露，但要收窄
+- **我自己去敲它**（我打开 Grafana 看图表）→ 用隧道，永远不要暴露
+
+**改法**：四个 Service 全部改成 `ClusterIP`，防火墙对应端口一并关掉。
+
+**访问方式**（ClusterIP 从节点宿主机上是可达的，
+因为 kube-proxy 的转发规则写在 host network namespace 里）：
+
+```bash
+# 先拿到 ClusterIP
+kubectl get svc -n monitoring
+```
+
+**本地 PowerShell，一条命令开四个隧道：**
+
+```powershell
+ssh -N -L 3000:10.43.x.x:3000 -L 9090:10.43.x.x:9090 -L 9093:10.43.x.x:9093 -L 8080:10.43.x.x:8080 root@<你的公网IP>
+```
+
+浏览器分别开 `http://localhost:3000`（Grafana）、`:9090`（Prometheus）、
+`:9093`（Alertmanager）、`:8080`（诊断卡片）。
+
+> 好处是**流量全程走 SSH 加密**，而且这四个端口从公网**完全不可达**——
+> 不是"靠防火墙挡着"，是 Kubernetes 层面就没有对外端口。
+
+**什么时候真的需要 NodePort**：`webhook-relay` 的 30096。
+因为那条流量是 **GitHub 主动敲我们**，隧道做不到（对方不是我们）。
+
 ---
 
 ## 已知限制
@@ -676,6 +729,7 @@ kubectl exec <pod> -- ls -la /app
 - [x] ~~Webhook 改造（ArgoCD 秒级同步）~~（`webhook-relay` NodePort **30096**，见 README 第 25 条）
 - [ ] App-of-Apps 模式（用一个根 Application 管理全部子 Application）
 - [x] ~~ArgoCD GitOps~~（已完成：demo-app 已由 Git 自动同步）
+- [ ] 凭据加固：Grafana 的 `admin123` 改为从 Secret 注入（密码不进 Git）
 - [ ] Istio 灰度发布
 - [ ] ArgoCD GitOps（本仓库直接作为 ArgoCD 的源）
 - [ ] AIOps：aiops-anomaly 异常检测 / sre-ai-agent 告警自动分析

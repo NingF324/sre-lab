@@ -97,13 +97,14 @@ metadata:
   name: grafana
   namespace: monitoring
 spec:
-  type: NodePort
+  # ClusterIP 而不是 NodePort：管理界面不该暴露在公网。
+  # 访问方式改为 SSH 隧道直达 ClusterIP，见 README 第 27 条。
+  type: ClusterIP
   selector:
     app: grafana
   ports:
     - port: 3000
       targetPort: 3000
-      nodePort: 30030
 
 ---
 # Grafana 状态目录（sqlite + 仪表盘 + 插件）

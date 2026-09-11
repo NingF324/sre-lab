@@ -295,13 +295,13 @@ metadata:
   name: prometheus
   namespace: monitoring
 spec:
-  type: NodePort
+  # ClusterIP：Prometheus 的 UI/API 不对外暴露，走 SSH 隧道访问
+  type: ClusterIP
   selector:
     app: prometheus
   ports:
     - port: 9090
       targetPort: 9090
-      nodePort: 30090
 
 ---
 # TSDB 存储。retention 7d + cAdvisor 指标量不小，给 8Gi。

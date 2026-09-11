@@ -109,13 +109,13 @@ metadata:
   name: alertmanager
   namespace: monitoring
 spec:
-  type: NodePort
+  # ClusterIP：Silence 管理界面不对外暴露，走 SSH 隧道访问
+  type: ClusterIP
   selector:
     app: alertmanager
   ports:
     - port: 9093
       targetPort: 9093
-      nodePort: 30093
 
 ---
 # Silence / 通知状态存储，量很小，1Gi 足够
