@@ -287,6 +287,28 @@ spec:
             - --web.enable-lifecycle
           ports:
             - containerPort: 9090
+              name: http
+          # TSDB/WAL 恢复期间进程已启动，但查询接口仍会返回 503。
+          # startupProbe 防止恢复较慢时被误杀；readinessProbe 确保 Service
+          # 只把流量发给真正可查询的实例。
+          startupProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 3
           resources:
             requests:
               memory: 256Mi
