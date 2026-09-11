@@ -221,6 +221,18 @@ spec:
               port: 8080
             initialDelaySeconds: 3
             periodSeconds: 10
+          # 代码从 ConfigMap 挂进来。
+          # 教训：声明了 ConfigMap 不等于挂载了 —— 少了下面这段，
+          # 容器照样能起来，但 python 会报
+          #   can't open file '/app/app.py': No such file or directory
+          volumeMounts:
+            - name: code
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: code
+          configMap:
+            name: webhook-relay-code
 
 ---
 apiVersion: v1

@@ -603,6 +603,38 @@ argocd-server  /api/webhook    ← 集群内，不再暴露公网
 4. **投递记录不落盘**。这是排障用的临时视图，重启丢失可以接受；
    真要审计就该落库，不该往文件里堆。
 
+### 26. 声明了 ConfigMap ≠ 挂载了 ConfigMap
+
+写 `webhook-relay` 时犯的低级错误，但症状很有迷惑性：
+
+```yaml
+containers:
+  - name: relay
+    command: ["python", "/app/app.py"]   # 引用了 /app/app.py
+    # ← 忘了写 volumeMounts，也没写 volumes
+```
+
+**Pod 能正常调度、镜像能拉、容器能启动**，然后立刻崩：
+
+```
+python: can't open file '/app/app.py': [Errno 2] No such file or directory
+```
+
+原因是 `command` 只是**约定**要读这个路径，并没有保证它存在。
+`ConfigMap` 对象存在 ≠ 它被挂进容器了 —— 中间必须有 `volumes` + `volumeMounts` 两处声明。
+
+**排查要点**：看到"文件不存在"但 ConfigMap 明明存在时，先看 Pod 的卷有没有挂上：
+
+```bash
+kubectl get pod <pod> -o jsonpath='{.spec.volumes[*].name}{"\n"}'
+kubectl get pod <pod> -o jsonpath='{.spec.containers[0].volumeMounts[*].mountPath}{"\n"}'
+kubectl exec <pod> -- ls -la /app
+```
+
+**更通用的教训**：这类"声明与挂载分离"的设计在 K8s 里到处都是
+（ConfigMap、Secret、PVC、ServiceAccount、hostPath），
+**对象存在只是必要条件，不是充分条件**。凡是"资源建了但用不上"，先查引用链有没有断。
+
 ---
 
 ## 已知限制
