@@ -1,0 +1,240 @@
+# Webhook 转发器（webhook-relay）
+#
+# 为什么需要它：
+#   ArgoCD 原生支持 GitHub webhook，但我们的拉取源是 Gitee
+#   （github.com 的 git 协议在本环境间歇性 TLS 超时，见 README 第 24 条）。
+#   ArgoCD 是靠 payload 里的仓库 URL 去匹配 Application 的 repoURL 的，
+#   GitHub(NingF324) 和 Gitee(ningf321) 路径不同 -> 匹配不上 -> 不会刷新。
+#
+#   所以中间加一层：把 GitHub 的事件改写成"Gitee 坐标"的 GitHub 格式 payload，
+#   再以 X-GitHub-Event: push 打给 ArgoCD 的 /api/webhook。
+#
+#   链路：GitHub push -> relay(30096) -> argocd-server:/api/webhook -> 刷新 App
+#
+# 附带好处（这才是真正的收益）：
+#   配好 relay 后，公网只需要开放 relay 这一个端口，
+#   argocd-server 的 30080 可以撤掉 —— ArgoCD 的 UI 和 API 不再是公网可达，
+#   只留一条"只能收 webhook"的窄缝。见 README 第 25 条。
+#
+# 设计取舍：
+#   - 纯标准库，零 pip 依赖，代码放 ConfigMap 挂载（跟 alert-enricher 同一套路）
+#   - 投递记录只存内存：这是排障用的临时视图，重启丢失可以接受。
+#     如果要持久化审计，就该落库而不是堆在文件里
+#   - 令牌走 URL 路径而不是 HTTP 头：GitHub 的 webhook 配置不允许自定义请求头
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webhook-relay-code
+  namespace: argocd
+data:
+  app.py: |
+    #!/usr/bin/env python3
+    # -*- coding: utf-8 -*-
+    import json, os, time, urllib.request, urllib.error, urllib.parse
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Lock
+
+    # ArgoCD 的 webhook 端点（集群内直连，不走公网）
+    ARGOCD_URL = os.environ.get("ARGOCD_URL",
+        "http://argocd-server.argocd.svc.cluster.local/api/webhook")
+    # 访问令牌：放在 URL 路径里，防止被人随便打
+    TOKEN = os.environ.get("RELAY_TOKEN", "")
+    # 目标仓库坐标：ArgoCD 就是要拿它去匹配 Application.repoURL
+    TARGET = os.environ.get("TARGET_REPO", "https://gitee.com/ningf321/sre-lab.git")
+    MAXLOG = 30
+
+    RECENT = []          # 内存里的最近投递记录，供 / 页面查看
+    LOCK = Lock()
+
+    def build_payload(src):
+        """把 GitHub/Gitee 的 push 事件改写成 ArgoCD 能匹配 Gitee 源的 payload"""
+        base = TARGET[:-4] if TARGET.endswith(".git") else TARGET
+        repo = src.get("repository") or {}
+        ref = src.get("ref") or "refs/heads/master"
+        return {
+            "ref": ref,
+            "before": src.get("before") or "",
+            "after": src.get("after") or "",
+            "repository": {
+                # 五个 URL 字段全填上：ArgoCD 会逐个跟 Application.repoURL 比对，
+                # 填全了才不会因为某个字段为空而漏匹配
+                "full_name": repo.get("full_name") or "ningf321/sre-lab",
+                "clone_url": base + ".git",
+                "html_url": base,
+                "url": base,
+                "git_url": base + ".git",
+                "ssh_url": "git@gitee.com:ningf321/sre-lab.git",
+            },
+        }
+
+    def forward(payload):
+        """以 GitHub 的事件格式转发给 ArgoCD"""
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(ARGOCD_URL, data=body, method="POST", headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "push",          # 关键：让 ArgoCD 走 GitHub 解析器
+            "User-Agent": "webhook-relay/1.0",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return r.status, r.read().decode("utf-8", "replace")[:300]
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "replace")[:300]
+        except Exception as e:
+            return 0, "forward error: %s" % e
+
+    def parse_body(ctype, raw):
+        """兼容 JSON 和 form 两种提交方式（GitHub 默认可能用 form）"""
+        if "application/json" in (ctype or ""):
+            return json.loads(raw.decode("utf-8"))
+        # x-www-form-urlencoded: payload=<json>
+        qs = urllib.parse.parse_qs(raw.decode("utf-8"))
+        return json.loads(qs.get("payload", ["{}"])[0])
+
+    def esc(s):
+        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    PAGE = """<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+    <title>Webhook Relay</title></head>
+    <body style="font-family:Microsoft YaHei,sans-serif;background:#f6f7f9;margin:0;padding:24px;max-width:900px;margin:0 auto">
+    <h2 style="margin:8px 0">ArgoCD Webhook 转发器</h2>
+    <p style="color:#8a93a3;font-size:13px">GitHub push → 改写成 Gitee 坐标 → ArgoCD /api/webhook → 触发刷新</p>
+    <p style="font-size:13px">目标仓库：<code>%s</code></p>""" % esc(TARGET)
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, code, body, ctype="text/html; charset=utf-8"):
+            data = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, fmt, *args):
+            pass   # 关掉默认的逐请求打印，避免日志噪音
+
+        def do_POST(self):
+            path = self.path.split("?")[0]
+            if not path.startswith("/hook/"):
+                return self._send(404, "not found", "text/plain")
+            if not TOKEN:
+                return self._send(503, "relay token not configured", "text/plain")
+            if path.split("/hook/", 1)[1] != TOKEN:
+                print("[relay] REJECT bad token from %s" % self.client_address[0], flush=True)
+                return self._send(403, "forbidden", "text/plain")
+
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(n)
+            try:
+                src = parse_body(self.headers.get("Content-Type"), raw)
+            except Exception as e:
+                return self._send(400, "bad payload: %s" % e, "text/plain")
+
+            payload = build_payload(src)
+            code, resp = forward(payload)
+            rec = {
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "event": self.headers.get("X-GitHub-Event", "-"),
+                "ref": payload["ref"],
+                "argocd_code": code,
+                "argocd_resp": resp,
+            }
+            with LOCK:
+                RECENT.append(rec)
+                del RECENT[:-MAXLOG]
+            print("[relay] event=%s ref=%s -> argocd %s" % (rec["event"], rec["ref"], code), flush=True)
+            # 即使 ArgoCD 返回非 200 也回 200 给 GitHub：
+            # 否则 GitHub 会按失败重试，制造重复投递
+            self._send(200, json.dumps({"forwarded": True, "argocd_code": code}),
+                       "application/json")
+
+        def do_GET(self):
+            if self.path == "/healthz":
+                return self._send(200, "ok", "text/plain")
+            if self.path != "/":
+                return self._send(404, "not found", "text/plain")
+            rows = []
+            with LOCK:
+                for r in reversed(RECENT):
+                    color = "#16a34a" if r["argocd_code"] == 200 else "#dc2626"
+                    rows.append(
+                        "<div style='border:1px solid #e5e8ee;border-left:4px solid %s;"
+                        "border-radius:8px;padding:10px 14px;margin:8px 0;background:#fff'>"
+                        "<b>%s</b> <small>%s</small><br>"
+                        "<small>ref=%s → ArgoCD <b style='color:%s'>%s</b></small>"
+                        "<pre style='white-space:pre-wrap;background:#f8fafc;border-radius:6px;"
+                        "padding:8px;font-size:12px;margin:6px 0 0'>%s</pre></div>"
+                        % (color, esc(r["event"]), esc(r["time"]), esc(r["ref"]),
+                           color, r["argocd_code"], esc(r["argocd_resp"])))
+            self._send(200, PAGE + ("".join(rows) or "<p>还没有投递记录，去推一个 commit 试试。</p>"))
+
+    if __name__ == "__main__":
+        srv = ThreadingHTTPServer(("0.0.0.0", 8080), Handler)
+        print("webhook-relay listening on :8080", flush=True)
+        srv.serve_forever()
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-relay
+  namespace: argocd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: webhook-relay
+  template:
+    metadata:
+      labels:
+        app: webhook-relay
+    spec:
+      containers:
+        - name: relay
+          image: python:3.11-slim
+          command: ["python", "/app/app.py"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: RELAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: webhook-relay-token
+                  key: token
+                  # optional：没建 Secret 时容器照常起，但会拒绝所有请求
+                  # （fail-closed，宁可不可用也不能裸奔）
+                  optional: true
+            - name: TARGET_REPO
+              value: https://gitee.com/ningf321/sre-lab.git
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 20m
+            limits:
+              memory: 96Mi
+              cpu: 200m
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-relay
+  namespace: argocd
+spec:
+  type: NodePort
+  selector:
+    app: webhook-relay
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      nodePort: 30096
+      protocol: TCP

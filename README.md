@@ -557,6 +557,52 @@ timeout 20 wget -qO- "https://gitee.com/ningf321/sre-lab.git/info/refs?service=g
 结论：本环境（腾讯云上海）访问 GitHub 的 git 协议不稳定，
 **ArgoCD 的拉取源用 Gitee，GitHub 只作镜像和 webhook 来源**。
 
+### 25. 公网只留一条"窄缝"：为什么最后加了一层 relay
+
+**起因**：为了收 GitHub 的 webhook，我们把整个 `argocd-server` 暴露在了 NodePort 30080 上。
+虽然靠防火墙白名单兜住了，但架构上是错的——
+
+> **"给 webhook 开一个口"和"把管理界面放到公网"是两件事，而 NodePort 区分不了。**
+> Service 只能转发端口，不能按 URL 路径过滤。
+
+同时 GitHub 拉取不稳定（第 24 条），拉取源必须留在 Gitee，
+而 Gitee 又不在 ArgoCD 原生 webhook 支持列表里（第 23 条）。
+
+两个问题一个解法：**在中间加一层只做一件事的转发器**。
+
+```
+GitHub push
+    │  HTTP（防火墙只放行 GitHub 的 IP 段）
+    ▼
+webhook-relay  :30096          ← 公网唯一的入口，只认 /hook/<token>
+    │  改成 Gitee 坐标的 GitHub 格式 payload
+    ▼
+argocd-server  /api/webhook    ← 集群内，不再暴露公网
+    │  按 payload 里的 repoURL 匹配 Application
+    ▼
+刷新（秒级）
+```
+
+**收益**：
+
+| 之前 | 之后 |
+|---|---|
+| 30080 暴露整个 ArgoCD（UI + API + 登录页） | 只暴露 relay，只认一个路径 + 一个令牌 |
+| UI 靠防火墙白名单挡着 | **30080 可以直接撤掉**，UI 永久留在隧道后面 |
+| Gitee 源收不到 webhook | 秒级同步可用，且拉取源稳定 |
+
+**顺带把"转发器怎么写对"这件事讲清楚**，这几条生产里踩过才知道：
+
+1. **对上游永远回 200**。ArgoCD 返回非 200 时，relay 照样回 GitHub 200——
+   否则 GitHub 会判定投递失败并**反复重试**，制造重复投递风暴。
+   转发失败是 relay 的内部问题，不该让上游承担。
+2. **令牌放 URL 路径，不放请求头**。GitHub 的 webhook 配置**不允许自定义请求头**，
+   所以只能用 `/hook/<随机串>` 这种形式。
+3. **缺令牌时 fail-closed**。Secret 不存在就拒绝所有请求并打日志，
+   而不是"没配就当没这回事"放行——**安全配置缺失必须表现为不可用，不能表现为静默降级**。
+4. **投递记录不落盘**。这是排障用的临时视图，重启丢失可以接受；
+   真要审计就该落库，不该往文件里堆。
+
 ---
 
 ## 已知限制
@@ -586,7 +632,7 @@ timeout 20 wget -qO- "https://gitee.com/ningf321/sre-lab.git/info/refs?service=g
 - [ ] 日志告警（Loki Ruler：ERROR 日志速率超阈值告警）
 - [x] ~~持久化改造（PVC 替代 emptyDir）~~（已完成：Prometheus / Loki / Grafana / Alertmanager / enricher 全部 PVC）
 - [ ] kube-state-metrics（补齐 Deployment 维度指标）
-- [x] ~~Webhook 改造（ArgoCD 秒级同步）~~（已配置 `argocd-webhook` NodePort **30080**，待推送验证）
+- [x] ~~Webhook 改造（ArgoCD 秒级同步）~~（`webhook-relay` NodePort **30096**，见 README 第 25 条）
 - [ ] App-of-Apps 模式（用一个根 Application 管理全部子 Application）
 - [x] ~~ArgoCD GitOps~~（已完成：demo-app 已由 Git 自动同步）
 - [ ] Istio 灰度发布
