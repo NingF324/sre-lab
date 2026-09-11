@@ -771,8 +771,8 @@ env:
 
   ⚠️ **local-path 默认 `allowVolumeExpansion=false`，卷不能在线扩容**，
   初次申请要留足余量，真满了只能重建 PVC 再导数据。生产应换云盘 CSI 并开启扩容。
-- **没有 kube-state-metrics**：Deployment/ReplicaSet 维度的指标拿不到，
-  Pod 重启告警改用 `changes(container_start_time_seconds[10m]) > 2` 从 cAdvisor 侧实现。
+- **kube-state-metrics 当前只采集四类对象**：Deployment / ReplicaSet / Pod / Node。
+  StatefulSet、Job 等对象暂未启用，需要时同步扩展 `--resources` 和 RBAC。
 - **Promtail 用静态采集**：见踩坑 9。
 - **单机**：没有多节点调度、亲和性、网络策略的练手条件。
 
@@ -780,9 +780,9 @@ env:
 
 ## 后续路线
 
-- [ ] 日志告警（Loki Ruler：ERROR 日志速率超阈值告警）
+- [x] ~~日志告警（Loki Ruler：ERROR 日志速率超阈值告警）~~（已完成：触发、通知、诊断卡片及恢复均已验证）
 - [x] ~~持久化改造（PVC 替代 emptyDir）~~（已完成：Prometheus / Loki / Grafana / Alertmanager / enricher 全部 PVC）
-- [ ] kube-state-metrics（补齐 Deployment 维度指标）
+- [x] ~~kube-state-metrics（补齐 Deployment 维度指标）~~（已完成：Deployment / ReplicaSet / Pod / Node）
 - [x] ~~Webhook 改造（ArgoCD 秒级同步）~~（`webhook-relay` NodePort **30096**，见 README 第 25 条）
 - [ ] App-of-Apps 模式（用一个根 Application 管理全部子 Application）
 - [x] ~~ArgoCD GitOps~~（已完成：demo-app 已由 Git 自动同步）
