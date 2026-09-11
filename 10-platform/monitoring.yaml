@@ -66,8 +66,22 @@ spec:
           ports:
             - containerPort: 3000
           env:
+            # 密码从 Secret 注入，绝不写进 Git。
+            # ⚠️ 关键坑：Grafana 首次启动后会把管理密码存进 grafana.db（在 PVC 里），
+            # 之后改这个环境变量**不会生效** —— 它只在"全新的 grafana.db"上起作用。
+            # 存量实例必须用 CLI 重置：
+            #   kubectl exec -n monitoring deploy/grafana -- \
+            #     grafana cli admin reset-admin-password '<新密码>'
+            # 这与"改了 ConfigMap 进程不重载"是同一类问题：
+            # **配置源变更 ≠ 运行态变更**，要看组件把状态存在哪。
             - name: GF_SECURITY_ADMIN_PASSWORD
-              value: "admin123"
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-admin
+                  key: password
+                  # 不用 optional：凭据缺失必须让 Pod 起不来（fail loudly），
+                  # 而不是悄悄退回 Grafana 的默认口令 admin/admin
+                  optional: false
           resources:
             requests:
               memory: 128Mi

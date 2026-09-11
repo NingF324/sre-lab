@@ -697,6 +697,63 @@ ssh -N -L 3000:10.43.x.x:3000 -L 9090:10.43.x.x:9090 -L 9093:10.43.x.x:9093 -L 8
 **什么时候真的需要 NodePort**：`webhook-relay` 的 30096。
 因为那条流量是 **GitHub 主动敲我们**，隧道做不到（对方不是我们）。
 
+### 28. 改了 Grafana 的环境变量，密码却没变 —— 配置源 ≠ 运行态
+
+原来密码是硬编码的：
+
+```yaml
+env:
+  - name: GF_SECURITY_ADMIN_PASSWORD
+    value: "admin123"        # 两个问题：弱口令 + 密码进了 public 仓库
+```
+
+改成 Secret 注入后，**第一次尝试会发现密码根本没变**。原因：
+
+> **Grafana 首次启动时会把管理密码写进 `grafana.db`**（在 PVC 里）。
+> 之后启动只读数据库，`GF_SECURITY_ADMIN_PASSWORD` 被忽略。
+> 这个环境变量只对**全新的数据库**起作用。
+
+存量实例必须用 CLI 重置：
+
+```bash
+kubectl exec -n monitoring deploy/grafana -- grafana cli admin reset-admin-password '<新密码>'
+```
+
+**这是一类问题的又一个实例**，和踩坑 24（ConfigMap 改了进程不重载）本质相同：
+
+| 组件 | 配置变更后是否需要额外动作 |
+|---|---|
+| Prometheus | 需要 `POST /-/reload` |
+| Alertmanager | 自动监听文件变化重载 |
+| Grafana | 环境变量只影响首次初始化，之后改数据库 |
+| Loki | `schema_config` 只对新数据生效，老数据不变 |
+
+**通用判断方法**：问一句"这个配置是启动时读一次，还是每次运行都读？它的状态存在哪？"
+—— 答案决定了改完之后要不要额外推一把。
+
+#### 密码管理的三级演进（面试常问）
+
+| 级别 | 做法 | 问题 |
+|---|---|---|
+| 1 | 明文写进 YAML | public 仓库 = 全世界可见（就是踩的这个） |
+| 2 | K8s Secret 注入 | 密码不进 Git。但 **Secret 只是 base64 编码，不是加密** —— 能读 Secret 的人就能拿到密码 |
+| 3 | SealedSecrets / External Secrets / Vault | Secret 密文可以进 Git，真加密、可审计、能轮转 |
+
+**级别 2 的补充**：生产还要给 etcd 配静态加密（`EncryptionConfiguration`），
+否则 Secret 在 etcd 里就是明文；同时用 RBAC 把 `get secret` 权限收到最小。
+
+```yaml
+env:
+  - name: GF_SECURITY_ADMIN_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: grafana-admin
+        key: password
+        # 不用 optional：凭据缺失必须让 Pod 起不来（fail loudly），
+        # 而不是悄悄退回 Grafana 的默认口令 admin/admin
+        optional: false
+```
+
 ---
 
 ## 已知限制
@@ -729,7 +786,7 @@ ssh -N -L 3000:10.43.x.x:3000 -L 9090:10.43.x.x:9090 -L 9093:10.43.x.x:9093 -L 8
 - [x] ~~Webhook 改造（ArgoCD 秒级同步）~~（`webhook-relay` NodePort **30096**，见 README 第 25 条）
 - [ ] App-of-Apps 模式（用一个根 Application 管理全部子 Application）
 - [x] ~~ArgoCD GitOps~~（已完成：demo-app 已由 Git 自动同步）
-- [ ] 凭据加固：Grafana 的 `admin123` 改为从 Secret 注入（密码不进 Git）
+- [x] ~~凭据加固：Grafana 的 admin123 改为从 Secret 注入~~（已完成，见 README 第 28 条）
 - [ ] Istio 灰度发布
 - [ ] ArgoCD GitOps（本仓库直接作为 ArgoCD 的源）
 - [ ] AIOps：aiops-anomaly 异常检测 / sre-ai-agent 告警自动分析
