@@ -47,6 +47,46 @@ data:
 
     RECENT = []          # 内存里的最近投递记录，供 / 页面查看
     LOCK = Lock()
+    STATS = {
+        "forward_success": 0,
+        "forward_failure": 0,
+        "rejected": 0,
+        "bad_payload": 0,
+    }
+    LAST_FORWARD_TIME = 0
+    LAST_FORWARD_CODE = 0
+
+    def record_result(result, code=0):
+        global LAST_FORWARD_TIME, LAST_FORWARD_CODE
+        with LOCK:
+            STATS[result] += 1
+            if result in ("forward_success", "forward_failure"):
+                LAST_FORWARD_TIME = int(time.time())
+                LAST_FORWARD_CODE = code
+
+    def prometheus_metrics():
+        with LOCK:
+            stats = dict(STATS)
+            last_time = LAST_FORWARD_TIME
+            last_code = LAST_FORWARD_CODE
+        lines = [
+            "# HELP webhook_relay_info Static information about the webhook relay.",
+            "# TYPE webhook_relay_info gauge",
+            'webhook_relay_info{version="1.1"} 1',
+            "# HELP webhook_relay_requests_total Webhook requests by final result.",
+            "# TYPE webhook_relay_requests_total counter",
+        ]
+        for result, value in sorted(stats.items()):
+            lines.append('webhook_relay_requests_total{result="%s"} %d' % (result, value))
+        lines.extend([
+            "# HELP webhook_relay_last_forward_timestamp_seconds Unix timestamp of the last forward attempt.",
+            "# TYPE webhook_relay_last_forward_timestamp_seconds gauge",
+            "webhook_relay_last_forward_timestamp_seconds %d" % last_time,
+            "# HELP webhook_relay_last_forward_status_code HTTP status from the latest ArgoCD forward.",
+            "# TYPE webhook_relay_last_forward_status_code gauge",
+            "webhook_relay_last_forward_status_code %d" % last_code,
+        ])
+        return "\n".join(lines) + "\n"
 
     def build_payload(src):
         """把 GitHub/Gitee 的 push 事件改写成 ArgoCD 能匹配 Gitee 源的 payload"""
@@ -120,8 +160,10 @@ data:
             if not path.startswith("/hook/"):
                 return self._send(404, "not found", "text/plain")
             if not TOKEN:
+                record_result("rejected")
                 return self._send(503, "relay token not configured", "text/plain")
             if path.split("/hook/", 1)[1] != TOKEN:
+                record_result("rejected")
                 print("[relay] REJECT bad token from %s" % self.client_address[0], flush=True)
                 return self._send(403, "forbidden", "text/plain")
 
@@ -130,10 +172,12 @@ data:
             try:
                 src = parse_body(self.headers.get("Content-Type"), raw)
             except Exception as e:
+                record_result("bad_payload")
                 return self._send(400, "bad payload: %s" % e, "text/plain")
 
             payload = build_payload(src)
             code, resp = forward(payload)
+            record_result("forward_success" if code == 200 else "forward_failure", code)
             rec = {
                 "time": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "event": self.headers.get("X-GitHub-Event", "-"),
@@ -153,6 +197,9 @@ data:
         def do_GET(self):
             if self.path == "/healthz":
                 return self._send(200, "ok", "text/plain")
+            if self.path == "/metrics":
+                return self._send(200, prometheus_metrics(),
+                                  "text/plain; version=0.0.4; charset=utf-8")
             if self.path != "/":
                 return self._send(404, "not found", "text/plain")
             rows = []
@@ -190,6 +237,8 @@ spec:
     metadata:
       labels:
         app: webhook-relay
+      annotations:
+        config-revision: "2026-09-11-metrics"
     spec:
       containers:
         - name: relay

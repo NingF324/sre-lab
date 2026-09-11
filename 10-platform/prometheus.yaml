@@ -93,6 +93,23 @@ data:
         static_configs:
           - targets: [kube-state-metrics:8080]
 
+      # 监控平台自身：这些管理端点都只在集群内访问。
+      - job_name: grafana
+        static_configs:
+          - targets: [grafana:3000]
+
+      - job_name: loki
+        static_configs:
+          - targets: [loki:3100]
+
+      - job_name: argocd
+        static_configs:
+          - targets: [argocd-metrics.argocd.svc.cluster.local:8082]
+
+      - job_name: webhook-relay
+        static_configs:
+          - targets: [webhook-relay.argocd.svc.cluster.local:80]
+
       # kubelet 自身指标，走 https + ServiceAccount token
       - job_name: kubernetes-nodes
         scheme: https
@@ -199,6 +216,15 @@ data:
               summary: alertmanager is down
               description: "Alertmanager 已不可达 2 分钟，整条告警通知链路中断"
 
+          - alert: MonitoringComponentDown
+            expr: up{job=~"argocd|grafana|loki|webhook-relay|kube-state-metrics|node-exporter|kubernetes-nodes|kubernetes-cadvisor"} == 0
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: monitoring component is down
+              description: "监控组件 {{ $labels.job }} / {{ $labels.instance }} 已不可达 2 分钟"
+
       - name: pod.rules
         rules:
           # kube-state-metrics 直接读取 kubelet 记录的累计重启次数，
@@ -231,7 +257,8 @@ data:
               description: "{{ $labels.namespace }}/{{ $labels.pod }} 已处于 Pending 状态 5 分钟"
 
           - alert: TargetDown
-            expr: up == 0
+            # 平台组件由 meta.rules 负责；这里仅覆盖注解发现的业务目标，避免重复告警。
+            expr: up{job="kubernetes-pods"} == 0
             for: 2m
             labels:
               severity: critical
@@ -270,6 +297,8 @@ spec:
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
+        # ConfigMap 内容变化本身不会触发 Deployment 滚动更新。
+        config-revision: "2026-09-11-meta-monitoring"
     spec:
       serviceAccountName: prometheus
       # prometheus 官方镜像以 uid 65534（nobody）运行，

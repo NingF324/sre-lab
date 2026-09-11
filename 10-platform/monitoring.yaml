@@ -56,6 +56,8 @@ spec:
     metadata:
       labels:
         app: grafana
+      annotations:
+        config-revision: "2026-09-11-meta-monitoring"
     spec:
       # grafana 镜像以 uid 472 运行
       securityContext:
@@ -94,6 +96,12 @@ spec:
               mountPath: /var/lib/grafana
             - name: datasources
               mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+              readOnly: true
+            - name: provisioned-dashboards
+              mountPath: /var/lib/grafana/dashboards-provisioned
+              readOnly: true
       volumes:
         # 持久化：手建的仪表盘、用户、API Key 都存在这里，
         # 之前用 emptyDir 时 Grafana 一重启全没了（数据源靠 ConfigMap 能自愈，仪表盘不能）
@@ -103,6 +111,12 @@ spec:
         - name: datasources
           configMap:
             name: grafana-datasources
+        - name: dashboard-provider
+          configMap:
+            name: grafana-dashboard-provider
+        - name: provisioned-dashboards
+          configMap:
+            name: grafana-monitoring-system-dashboard
 
 ---
 apiVersion: v1

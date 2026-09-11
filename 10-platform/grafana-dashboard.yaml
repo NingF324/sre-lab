@@ -1,0 +1,106 @@
+# Grafana 声明式仪表盘：监控系统自身的可用性和资源占用。
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: monitoring
+data:
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: sre-lab
+        orgId: 1
+        folder: SRE Lab
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 30
+        allowUiUpdates: false
+        options:
+          path: /var/lib/grafana/dashboards-provisioned
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-monitoring-system-dashboard
+  namespace: monitoring
+data:
+  monitoring-system.json: |
+    {
+      "annotations": {"list": []},
+      "editable": false,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 1,
+      "id": null,
+      "links": [],
+      "panels": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "mappings": [
+                {"options": {"0": {"color": "red", "text": "DOWN"}, "1": {"color": "green", "text": "UP"}}, "type": "value"}
+              ],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 7, "w": 24, "x": 0, "y": 0},
+          "id": 1,
+          "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+          "targets": [
+            {"expr": "up{job=~\"prometheus|argocd|grafana|loki|webhook-relay|kube-state-metrics|alertmanager|node-exporter\"}", "legendFormat": "{{job}}", "refId": "A"}
+          ],
+          "title": "监控组件状态",
+          "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0}, "overrides": []},
+          "gridPos": {"h": 9, "w": 12, "x": 0, "y": 7},
+          "id": 2,
+          "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "sum by (namespace, pod) (rate(container_cpu_usage_seconds_total{namespace=~\"monitoring|argocd\",container!=\"\",container!=\"POD\"}[5m]))", "legendFormat": "{{namespace}}/{{pod}}", "refId": "A"}
+          ],
+          "title": "平台 Pod CPU 使用率",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"unit": "bytes", "min": 0}, "overrides": []},
+          "gridPos": {"h": 9, "w": 12, "x": 12, "y": 7},
+          "id": 3,
+          "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "sum by (namespace, pod) (container_memory_working_set_bytes{namespace=~\"monitoring|argocd\",container!=\"\",container!=\"POD\"})", "legendFormat": "{{namespace}}/{{pod}}", "refId": "A"}
+          ],
+          "title": "平台 Pod 内存使用量",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+          "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16},
+          "id": 4,
+          "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "scrape_duration_seconds{job=~\"prometheus|argocd|grafana|loki|webhook-relay|kube-state-metrics|alertmanager|node-exporter\"}", "legendFormat": "{{job}}", "refId": "A"}
+          ],
+          "title": "指标抓取耗时",
+          "type": "timeseries"
+        }
+      ],
+      "refresh": "15s",
+      "schemaVersion": 39,
+      "tags": ["sre-lab", "meta-monitoring"],
+      "templating": {"list": []},
+      "time": {"from": "now-1h", "to": "now"},
+      "timezone": "browser",
+      "title": "监控系统自身",
+      "uid": "sre-lab-meta-monitoring",
+      "version": 1
+    }
