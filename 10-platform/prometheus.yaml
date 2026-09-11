@@ -87,6 +87,12 @@ data:
         static_configs:
           - targets: [alertmanager:9093]
 
+      # Kubernetes 对象状态：Deployment 副本、Pod phase/重启、Node 状态。
+      # 单独使用静态 Service 地址，避免注解发现误抓 telemetry 端口。
+      - job_name: kube-state-metrics
+        static_configs:
+          - targets: [kube-state-metrics:8080]
+
       # kubelet 自身指标，走 https + ServiceAccount token
       - job_name: kubernetes-nodes
         scheme: https
@@ -195,15 +201,34 @@ data:
 
       - name: pod.rules
         rules:
-          # 没有 kube-state-metrics 时，用 cAdvisor 的启动时间变化判断重启
+          # kube-state-metrics 直接读取 kubelet 记录的累计重启次数，
+          # 比通过容器启动时间变化推算更准确。
           - alert: ContainerRestartingTooOften
-            expr: changes(container_start_time_seconds{container!="",namespace!="kube-system"}[10m]) > 2
+            expr: increase(kube_pod_container_status_restarts_total{namespace!="kube-system"}[10m]) > 2
             for: 0m
             labels:
               severity: warning
             annotations:
               summary: container is restarting too often
               description: "{{ $labels.namespace }}/{{ $labels.pod }} restarted more than 2 times in 10m"
+
+          - alert: DeploymentReplicasUnavailable
+            expr: (kube_deployment_spec_replicas{namespace!="kube-system"} - kube_deployment_status_replicas_available{namespace!="kube-system"}) > 0
+            for: 3m
+            labels:
+              severity: warning
+            annotations:
+              summary: deployment has unavailable replicas
+              description: "{{ $labels.namespace }}/{{ $labels.deployment }} 缺少 {{ printf \"%.0f\" $value }} 个可用副本，已持续 3 分钟"
+
+          - alert: PodPendingTooLong
+            expr: kube_pod_status_phase{namespace!="kube-system",phase="Pending"} == 1
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: pod has been pending too long
+              description: "{{ $labels.namespace }}/{{ $labels.pod }} 已处于 Pending 状态 5 分钟"
 
           - alert: TargetDown
             expr: up == 0
