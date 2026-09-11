@@ -603,6 +603,15 @@ argocd-server  /api/webhook    ← 集群内，不再暴露公网
 4. **投递记录不落盘**。这是排障用的临时视图，重启丢失可以接受；
    真要审计就该落库，不该往文件里堆。
 
+**2026-09-11 实测收口**：relay 打通后执行了 `kubectl delete svc argocd-webhook`，
+并从 Git 移除 `07-argocd/argocd-webhook.yaml`。公网入口只剩 30096。
+
+> ⚠️ **删集群资源时必须同时删 Git 里的声明。**
+> `argocd-extras` 是 `selfHeal: true`，只要声明还在 Git 里，
+> ArgoCD 下一轮就会把删掉的 Service **原样重建**出来 —— 手工删 = 白删。
+> 这是踩坑 13（配置漂移）的另一面：**GitOps 下集群状态永远向 Git 收敛，
+> 所以"删除"这个动作必须发生在 Git 里，而不是在集群里。**
+
 ### 26. 声明了 ConfigMap ≠ 挂载了 ConfigMap
 
 写 `webhook-relay` 时犯的低级错误，但症状很有迷惑性：
