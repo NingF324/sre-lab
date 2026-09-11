@@ -685,3 +685,5 @@ kubectl exec <pod> -- ls -la /app
 | Loki | 128Mi | 512Mi |
 | Promtail | 32Mi | 128Mi |
 | node-exporter | 32Mi | 128Mi |
+
+<!-- webhook verified 2026-09-11T10:56:43 -->
