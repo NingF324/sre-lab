@@ -171,6 +171,47 @@ metadata:
 data:
   alerts.yml: |
     groups:
+      # ===================================================================
+      # AIOps 第一阶段：动态基线
+      #
+      # 固定阈值的天生矛盾：定高了漏报，定低了误报。
+      # 而且指标有周期性（白天高夜里低），一条水平线必然有一半时间是错的。
+      #
+      # 换个思路：不用固定阈值，用指标**自己的近期分布**来定义"正常"。
+      # recording rule 先把中间量算好存下来，告警规则就能写得短，
+      # 而且多个告警可以复用同一批中间量（顺带省查询开销）。
+      #
+      # ⚠️ 这个 group 必须放在 node.rules 前面：Prometheus 按文件里的
+      #    顺序评估 group，告警要用到这里的 recording rule。
+      # ⚠️ 首次部署 / Prometheus 重启后，需要攒够 1 小时数据
+      #    （avg_over_time[1h] / stddev_over_time[1h]）才会开始出值。
+      # ===================================================================
+      - name: aiops.baseline
+        rules:
+          # ① 节点 CPU 使用率（0~1 的小数），5 分钟平滑
+          - record: node:cpu_busy:ratio5m
+            expr: 1 - avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))
+
+          # ② 近 1 小时的均值 —— 这就是"基线"
+          - record: node:cpu_busy:avg1h
+            expr: avg_over_time(node:cpu_busy:ratio5m[1h])
+
+          # ③ 近 1 小时的标准差 —— 衡量波动幅度，决定"多偏离才算异常"
+          - record: node:cpu_busy:stddev1h
+            expr: stddev_over_time(node:cpu_busy:ratio5m[1h])
+
+          # ④ 偏离度：当前值比基线高出多少个标准差（统计学叫 z-score）
+          #
+          #    clamp_min 是这里最关键的一笔：基线非常平稳时标准差趋近 0，
+          #    不设下限就会出现"CPU 从 1% 涨到 2%，判定为偏离 50 个标准差"
+          #    这种荒谬结论 —— 分母趋零把噪声放大成了"异常"。
+          #    给标准差一个下限，等于给检测器设了一个**最小灵敏度**。
+          #    这是所有基于标准差做异常检测的算法都要处理的第一个问题。
+          - record: node:cpu_busy:deviation_sigma
+            expr: >
+              (node:cpu_busy:ratio5m - node:cpu_busy:avg1h)
+              / clamp_min(node:cpu_busy:stddev1h, 0.02)
+
       - name: node.rules
         rules:
           - alert: NodeMemoryHigh
@@ -190,6 +231,30 @@ data:
             annotations:
               summary: node cpu usage is high
               description: "{{ $labels.instance }} idle cpu is only {{ printf \"%.1f\" $value }}% for 5m"
+
+          # ===== AIOps 异常检测第一版 =====
+          # 与上面的 NodeCPUHigh 是互补关系，不是替代：
+          #   NodeCPUHigh          回答"现在是不是很忙"（绝对值，>80%）
+          #   NodeCPUDeviationHigh 回答"现在是不是反常"（相对值，偏离基线 >3σ）
+          #
+          # 为什么需要后者：低负载机器上固定阈值几乎永远不报警。
+          # 一台平时 CPU 2% 的机器跳到 15%，业务上可能已经出问题了
+          # （定时任务失控、死循环、被挖矿），但 80% 的阈值一声不吭。
+          # 动态基线看的是"相对自己反常"，正好覆盖这一段盲区。
+          - alert: NodeCPUDeviationHigh
+            # 写法说明：把 ratio 放在 and 左边，是为了让 $value 代表 CPU 使用率
+            # （描述里要用）；偏离度只作为过滤条件放右边。
+            # 若反过来写，$value 会变成 σ 数，就没法直接展示百分比了。
+            expr: >
+              node:cpu_busy:ratio5m > 0.3
+              and
+              node:cpu_busy:deviation_sigma > 3
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: node cpu is significantly above its recent baseline
+              description: "{{ $labels.instance }} CPU 使用率 {{ $value | humanizePercentage }}，偏离近 1 小时基线超过 3σ"
 
           # 磁盘不用固定阈值，用线性回归预测 4 小时后会不会满
           - alert: NodeDiskWillFillIn4Hours
