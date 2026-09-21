@@ -249,7 +249,17 @@ data:
               node:cpu_busy:ratio5m > 0.3
               and
               node:cpu_busy:deviation_sigma > 3
-            for: 5m
+            # for 只有 2m，比固定阈值告警的 5m 短一半 —— 这是刻意的。
+            #
+            # 原因：动态基线会把持续异常"吸收"进自己（基线漂移 / concept drift）。
+            # 实测：2 个 burner 起负载后 sigma 从 6.07 一路衰减
+            # （avg1h 上升、stddev1h 变大 -> 分子减小分母增大），
+            # 超过 3σ 的窗口只有约 5 分钟。
+            # 若 for 也设 5m，会**刚好卡在边界上只到 pending 就掉下去**，
+            # 永远进不了 firing。
+            #
+            # 基线本身已经起到平滑作用，for 不需要再叠一层。
+            for: 2m
             labels:
               severity: warning
             annotations:
