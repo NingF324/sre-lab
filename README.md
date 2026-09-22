@@ -1,68 +1,86 @@
 # sre-lab —— 单节点 SRE 可观测性实验环境
 
 一套跑在 **4 核 4G** 云服务器上的完整 SRE 练手环境：
-**可观测性三件套（指标 / 告警 / 日志）+ HPA 自动扩缩容 + GitOps 自动同步**。
+**可观测性三件套（指标 / 告警 / 日志）+ 告警富化与 AIOps 异常检测 + HPA 自动扩缩容 + GitOps 自动同步**。
 所有组件从零手写 YAML 部署，不用 Helm Chart，目的是**把每个组件的行为和取舍都摸清楚**。
 
 > 硬件：腾讯云轻量 4C4G / 40G / OpenCloudOS 9.6（RHEL 系，对齐生产栈）
 > 集群：k3s v1.36.4+k3s1，单节点
 > 仓库：<https://github.com/NingF324/sre-lab>
+> 公网暴露面：**只有 30096（webhook relay）和 22（SSH）**，其余全部走 SSH 隧道
 
 ---
 
 ## 架构
 
 ```
-                    ┌──────────────────────────────────────┐
-   浏览器 ──────────▶│ Grafana :30030  指标 / 日志 统一入口  │
-                    └────────┬─────────────────┬───────────┘
-                             │                 │
-                    ┌────────▼──────┐   ┌──────▼──────┐
-                    │ Prometheus    │   │ Loki :3100  │
-                    │ :30090        │   │ 只索引标签   │
-                    └───┬───────┬───┘   └──────▲──────┘
-                        │       │              │
-              ┌─────────▼──┐  ┌─▼──────────┐  ┌┴──────────┐
-              │Alertmanager│  │node-exporter│ │ Promtail   │
-              │  :30093    │  │ + cAdvisor  │ │ DaemonSet  │
-              └────────────┘  └─────────────┘ │ 读 /var/log/pods
-                                               └────────────┘
-                        ▲
-                        │ 被监控
-              ┌─────────┴─────────┐
-              │ demo 命名空间      │
-              │ php-apache + HPA  │
-              └───────────────────┘
+                      ┌───────────────────────────────────────┐
+   浏览器 ─隧道──────▶│ Grafana  指标 / 日志 / 元监控 统一入口  │
+                      └────┬─────────────────┬────────────────┘
+                           │                 │
+                 ┌─────────▼────────┐  ┌─────▼─────────┐
+                 │ Prometheus       │  │ Loki :3100    │
+                 │ 指标 + 规则求值   │  │ 只索引标签     │
+                 │ + 动态基线        │  │ + Ruler 日志告警│
+                 └──┬────────┬──────┘  └──────▲────────┘
+                    │        │                │
+        ┌───────────▼─┐  ┌───▼──────────────┐ │
+        │ Alertmanager│  │ node-exporter    │ │
+        │ (Silence)   │  │ cAdvisor         │ │
+        └──────┬──────┘  │ kube-state-metrics│ │
+               │         └──────────────────┘ │
+               ▼                    ┌─────────┴──┐
+        ┌──────────────┐            │ Promtail   │
+        │alert-enricher│            │ DaemonSet  │
+        │ 补指标+日志+  │            │ 读 /var/log/pods
+        │ LLM 诊断卡片  │            └────────────┘
+        └──────┬───────┘
+               ▲ 被监控
+        ┌──────┴──────────┐
+        │ demo 命名空间    │
+        │ php-apache + HPA│
+        └─────────────────┘
 ```
 
-**三条数据链路**：
+**四条数据链路**：
 
 | 链路 | 路径 | 解决的问题 |
 |---|---|---|
-| 指标 | cAdvisor / node-exporter → Prometheus → Grafana | 现在发生了什么 |
-| 告警 | Prometheus 规则 → Alertmanager → （钉钉/企微） | 什么时候需要人介入 |
+| 指标 | cAdvisor / node-exporter / kube-state-metrics → Prometheus → Grafana | 现在发生了什么 |
+| 告警 | Prometheus 规则 + Loki Ruler → Alertmanager → alert-enricher | 什么时候需要人介入 |
 | 日志 | 容器 stdout → Promtail → Loki → Grafana | 为什么会发生 |
+| 诊断 | Alertmanager webhook → alert-enricher（查指标 + 查日志 + LLM）→ 诊断卡片 | 这条告警该怎么处理 |
 
-三者凑齐才是完整的可观测性。只有指标能发现故障，只有日志能定位原因。
+前三条是可观测性的基础，第四条是 AIOps 的入口 ——
+**告警不该只告诉人"出事了"，还应该带上"大概什么原因、先看哪里"。**
 
 ### GitOps 层
 
 ```
-开发者 ──git push──▶ GitHub/Gitee 仓库
+开发者 ──git push──▶ GitHub（镜像仓库 + webhook 来源）
                           │
-                          │ ArgoCD 每 3 分钟轮询（或 webhook 推送）
+                          │  push 事件
                           ▼
-                   ArgoCD 对比 Git 声明 vs 集群实际状态
+                   webhook-relay :30096
+                   （改写成 Gitee 坐标的 GitHub 格式 payload）
+                          │
+                          ▼
+                   ArgoCD /api/webhook
+                          │
+                          ▼
+              按 payload 里的 repoURL 匹配 Application
                           │
                           ├─ 有差异 → 自动同步（selfHeal）
                           └─ 一致   → 什么都不做
                           │
                           ▼
-                  k8s 集群（Deployment / Service / HPA / Ingress）
+                  k8s 集群（Deployment / Service / HPA / PVC）
+
+     拉取源：Gitee（GitHub 的 git 协议跨境不稳定，见踩坑 24）
 ```
 
-**Git 是唯一事实来源。** 任何对集群的直接修改都会被 controller 按 Git 的声明改回去 ——
-这条机制在本次实践中以一次真实事故的形式验证过（见踩坑 13）。
+**Git 是唯一事实来源。** 任何对集群的直接操作都会被 controller 按 Git 的声明改回去 ——
+这条机制在本次实践中以**两次真实事故**的形式验证过（见踩坑 13 与 25）。
 
 ---
 
@@ -110,13 +128,17 @@ kubectl apply -f 06-gitops/root-app.yaml
 所以收敛出一份最终状态供 GitOps 消费：
 
 ```
-04-demo-app/   业务服务（Deployment + Service + HPA + Ingress）
-10-platform/   监控/告警/日志的最终状态，每个资源只保留最后一次修改的版本
+04-demo-app/    业务服务（Deployment + Service + HPA）
+07-argocd/      ArgoCD 自身的配件（webhook relay）
+10-platform/    监控/告警/日志的最终状态，每个资源只保留最后一次修改的版本
+20-aiops/       告警富化服务（alert-enricher）
 06-gitops/
-  ├── root-app.yaml         根 Application，只管下面这些 Application
+  ├── root-app.yaml            根 Application，只管下面这些 Application
   └── apps/
-      ├── platform-app.yaml   → 指向 10-platform
-      └── demo-app.yaml       → 指向 04-demo-app
+      ├── platform-app.yaml   → 10-platform
+      ├── demo-app.yaml       → 04-demo-app
+      ├── aiops-app.yaml      → 20-aiops
+      └── argocd-app.yaml     → 07-argocd
 ```
 
 **从零重建整套环境只要三步**（k3s 装好之后）：
@@ -127,9 +149,14 @@ kubectl apply --server-side=true --force-conflicts -n argocd -f argocd-install.y
 kubectl apply -f 06-gitops/root-app.yaml
 ```
 
-根 Application 会自动创建 `platform` 和 `demo-app` 两个子 Application，
-它们再各自同步自己负责的目录 —— 这就是 **App-of-Apps 模式**。
+根 Application 会自动创建 `platform` / `demo-app` / `aiops` / `argocd-extras`
+四个子 Application，它们再各自同步自己负责的目录 —— 这就是 **App-of-Apps 模式**。
 新增组件只需往 `apps/` 里加一个文件，根应用自动发现。
+
+> ⚠️ **但"三步重建"目前还缺一步**：三个 Secret（`deepseek-api` / `grafana-admin` /
+> `webhook-relay-token`）是手工 `kubectl create` 的，不在 Git 里。
+> 重建时必须先建它们，否则 Prometheus 之外的若干 Pod 会起不来。
+> **这是重建演练（P3）的头号阻塞点**，也是要上 SealedSecrets（P2）的原因。
 
 ### ArgoCD 说明
 
@@ -146,21 +173,36 @@ kubectl apply -f 06-gitops/root-app.yaml
   kubectl -n argocd get secret argocd-initial-admin-secret \
     -o jsonpath="{.data.password}" | base64 -d
   ```
-- 暴露 UI：`kubectl patch svc argocd-server -n argocd --type=json \
-  -p='[{"op":"replace","path":"/spec/type","value":"NodePort"}]'`
+- **不要把 UI 暴露到公网**：`argocd-server` 保持默认类型，用 SSH 隧道访问（见踩坑 27）。
+- 若要经 HTTP 访问（例如需要收 webhook），得设
+  `argocd-cmd-params-cm` 的 `server.insecure: "true"` ——
+  否则 HTTP 请求会 307 跳 HTTPS，而 **GitHub 的 webhook 不跟随重定向**（见踩坑 25）。
 
 > Grafana 数据源用 ConfigMap provisioning 注入，改完必须重启：
 > `kubectl rollout restart deployment/grafana -n monitoring`
 
-### 端口
+### 访问方式：SSH 隧道（没有公网端口）
 
-| 服务 | NodePort | 用途 |
-|---|---|---|
-| Grafana | 30030 | 指标 + 日志查询 |
-| Prometheus | 30090 | 规则、Targets |
-| Alertmanager | 30093 | 告警查看与静默 |
+监控栈全部是 `ClusterIP`，**公网只剩 30096（webhook relay）和 22（SSH）**。
 
-> 安全提醒：NodePort 直接暴露公网有风险，防火墙规则应**限制来源 IP**，Grafana 默认密码 `admin123` 首次登录后立即修改。
+本地 `~/.ssh/config` 里配好 `Host lab`（含 5 条 `LocalForward`），一条命令建好全部隧道：
+
+```shell
+ssh -N lab
+```
+
+| 本地地址 | 打开什么 |
+|---|---|
+| `http://localhost:3000` | Grafana |
+| `http://localhost:9090` | Prometheus |
+| `http://localhost:9093` | Alertmanager |
+| `http://localhost:8080` | 告警诊断卡片 |
+| `http://localhost:8081` | ArgoCD（注意是 **http**，那个端口只有明文 HTTP） |
+
+⚠️ 隧道目标是 **ClusterIP**，Service 重建后会重新分配，需要同步改 config。
+
+> 为什么不用 NodePort：`NodePort` 的语义是"在每个节点的所有网卡上开一个端口"，
+> 只要防火墙放行就是公网可达。管理界面没有理由挂到公网上 —— 见踩坑 27。
 
 ---
 
@@ -169,41 +211,68 @@ kubectl apply -f 06-gitops/root-app.yaml
 ```shell
 # 集群与组件
 kubectl get pods -A | grep -v Completed
+kubectl get pvc -n monitoring
 
-# Prometheus 抓取目标（应有 5 个 job 全 UP）
-# 浏览器打开 http://<节点IP>:30090/targets
+# Prometheus 抓取目标：所有 job 都应为 UP
+#   隧道打开后访问 http://localhost:9090/targets
+
+# 告警链路四段（排查方法见踩坑 18）
+kubectl exec -n monitoring deploy/prometheus   -- wget -qO- http://localhost:9090/api/v1/alertmanagers
+kubectl exec -n monitoring deploy/alertmanager -- wget -qO- 'http://localhost:9093/api/v2/alerts?active=true'
+kubectl logs -n monitoring deploy/alert-enricher --tail=5
 
 # HPA 能读到指标
 kubectl get hpa -n demo
 kubectl top pod -n demo
 
-# ArgoCD 同步状态
+# GitOps 同步状态与当前 revision
 kubectl get application -n argocd
-kubectl describe application demo-app -n argocd | tail -30
+kubectl get app platform -n argocd -o jsonpath='{.status.sync.revision}{"\n"}'
+
+# webhook 链路是否在转发
+kubectl logs -n argocd -l app=webhook-relay --tail=3
 ```
 
-> `describe` 的 Events 是排查同步问题最有效的手段，它记录了每一次
+> `describe application` 的 Events 是排查同步问题最有效的手段，它记录了每一次
 > `Synced → OutOfSync → Unknown` 的完整时间线。
 
 ### 亲手把告警打响
 
+**① 固定阈值告警**（`NodeCPUHigh`，idle < 20% 持续 5 分钟）
+
 ```shell
-# 起 4 个死循环 Pod 吃满 CPU（单节点 4 核，3 个只到 78%，不够）
+# 单节点 4 核，要 4 个死循环 Pod 才能压过 80%
 for i in 1 2 3 4; do
   kubectl run burner-$i --image=busybox:1.36 --restart=Never \
     -- /bin/sh -c 'while true; do :; done'
 done
-
-# 观察
 kubectl top node
 ```
 
-`NodeCPUHigh`（idle < 20% 持续 5 分钟）会走完 `inactive → Pending → FIRING`，
-随后出现在 Alertmanager。用完记得清理：
+**② 动态基线告警**（`NodeCPUDeviationHigh`，偏离基线 > 3σ 持续 2 分钟）——
+**只要 2 个 burner**，CPU 约 55%，**远低于 80% 的固定阈值**：
+
+```shell
+for i in 1 2; do
+  kubectl run burner-$i --image=busybox:1.36 --restart=Never \
+    -- /bin/sh -c 'while true; do :; done'
+done
+
+sleep 180          # ← 必须等够时间，否则永远看不到 firing
+kubectl exec -n monitoring deploy/prometheus -- \
+  wget -qO- 'http://localhost:9090/api/v1/rules?type=alert' | tr ',' '\n' | grep -A1 Deviation
+kubectl exec -n monitoring deploy/alert-enricher -- sh -c \
+  'grep -c NodeCPUDeviationHigh /data/alerts.jsonl'
+```
+
+清理：
 
 ```shell
 kubectl delete pod burner-1 burner-2 burner-3 burner-4 --force
 ```
+
+> 用完给基线留一段"洗白期"——这次负载的样本会在窗口里停留约 1 小时，
+> 抬高下一次实验的阈值（见踩坑 29）。
 
 ---
 
@@ -354,6 +423,10 @@ kubectl apply --server-side=true -n argocd -f argocd-install.yaml
 
 未配 webhook 时，push 之后最长要等 3 分钟才同步。
 生产环境必须给仓库配 webhook 指向 `/api/webhook`，实现 push 即触发的秒级同步。
+
+**本环境已解决**（2026-09-11）：GitHub push → `webhook-relay` → ArgoCD `/api/webhook`，实测秒级生效。
+但过程中撞到两件事，详见踩坑 23（ArgoCD 不支持 Gitee webhook）与
+踩坑 25（自建转发层 + 公网只留一条缝）。
 
 ### 16. `SYNC STATUS = Unknown`：repo-server 缓存卡死
 
@@ -842,25 +915,53 @@ env:
 
   ⚠️ **local-path 默认 `allowVolumeExpansion=false`，卷不能在线扩容**，
   初次申请要留足余量，真满了只能重建 PVC 再导数据。生产应换云盘 CSI 并开启扩容。
+- **Secret 仍需手工创建，是重建的头号阻塞点**：`deepseek-api` / `grafana-admin` /
+  `webhook-relay-token` 都不在 Git 里（密码不能明文进仓库）。
+  这意味着"从零重建三步走"目前**跑不通**，必须补手工步骤。
+  解法是 SealedSecrets / External Secrets（列为下一步 P2）。
 - **kube-state-metrics 当前只采集四类对象**：Deployment / ReplicaSet / Pod / Node。
   StatefulSet、Job 等对象暂未启用，需要时同步扩展 `--resources` 和 RBAC。
 - **Promtail 用静态采集**：见踩坑 9。
-- **单机**：没有多节点调度、亲和性、网络策略的练手条件。
+- **ClusterIP 写死在 SSH 配置里**：Service 重建后地址会变，隧道要同步改。
+- **镜像仓库跨境不稳定**：`registry.k8s.io` 已实测出现连接重置，
+  相关镜像已换国内来源，但后续新增组件还会遇到同样问题。
+- **单机**：没有多节点调度、亲和性、网络策略的练手条件；
+  节点故障即整套不可用，local-path 的数据也与节点绑定，不等于灾备。
+- **动态基线只做了 CPU**：内存、磁盘的基线尚未接入，做法可复用但需各自调参。
 
 ---
 
 ## 后续路线
 
-- [x] ~~日志告警（Loki Ruler：ERROR 日志速率超阈值告警）~~（已完成：触发、通知、诊断卡片及恢复均已验证）
-- [x] ~~持久化改造（PVC 替代 emptyDir）~~（已完成：Prometheus / Loki / Grafana / Alertmanager / enricher 全部 PVC）
-- [x] ~~kube-state-metrics（补齐 Deployment 维度指标）~~（已完成：Deployment / ReplicaSet / Pod / Node）
-- [x] ~~Webhook 改造（ArgoCD 秒级同步）~~（`webhook-relay` NodePort **30096**，见 README 第 25 条）
-- [ ] App-of-Apps 模式（用一个根 Application 管理全部子 Application）
-- [x] ~~ArgoCD GitOps~~（已完成：demo-app 已由 Git 自动同步）
-- [x] ~~凭据加固：Grafana 的 admin123 改为从 Secret 注入~~（已完成，见 README 第 28 条）
-- [ ] Istio 灰度发布
-- [ ] ArgoCD GitOps（本仓库直接作为 ArgoCD 的源）
-- [ ] AIOps：aiops-anomaly 异常检测 / sre-ai-agent 告警自动分析
+### 已完成
+
+- [x] **可观测性三件套** —— 指标 / 告警 / 日志三条链路打通
+- [x] **GitOps（App-of-Apps）** —— 根 Application 管理 4 个子应用，本仓库即 ArgoCD 的拉取源
+- [x] **ArgoCD 秒级同步** —— webhook-relay 把 GitHub push 转成 Gitee 坐标（踩坑 25）
+- [x] **持久化改造** —— Prometheus / Loki / Grafana / Alertmanager / enricher 全 PVC（踩坑 19–22）
+- [x] **管理界面撤出公网** —— 四个 Service 改 ClusterIP + SSH 隧道（踩坑 27）
+- [x] **凭据加固（第一级）** —— Grafana 密码从 Secret 注入，不再进 Git（踩坑 28）
+- [x] **Loki Ruler 日志告警** —— `DemoErrorLogsHigh`，触发 / 通知 / 卡片 / 恢复均已验证
+- [x] **kube-state-metrics** —— Deployment / ReplicaSet / Pod / Node 四类对象
+- [x] **元监控** —— Prometheus 抓 ArgoCD / Grafana / Loki / relay 自身，
+      新增 `MonitoringComponentDown` 与"监控系统自身"仪表盘
+- [x] **AIOps 异常检测第一版** —— CPU 动态基线 + 偏离度告警（踩坑 29）
+
+### 待做（按推荐顺序）
+
+- [ ] **文档与仓库口径统一** —— 本文件与进度文档互相对齐（进行中）
+- [ ] **凭据管理升级到第二级** —— SealedSecrets，让加密后的 Secret 也能进 Git
+- [ ] **环境重建演练** —— 从 k3s 裸环境恢复整套系统，必须留完整记录
+- [ ] **动态基线推广到内存 / 磁盘**
+- [ ] **CI 与供应链** —— GitHub Actions 构建镜像 + 漏洞扫描 + 不可变 tag/digest
+- [ ] **Istio 灰度发布** —— 先查内存余量，只装 istiod + 只给 demo 命名空间注入
+- [ ] 告警接入企业微信 / 钉钉（当前只有 webhook 到自建服务）
+
+### 长期方向
+
+- [ ] 三节点集群：调度、亲和性、NetworkPolicy
+- [ ] Loki 接对象存储（腾讯云 COS）
+- [ ] Prometheus 接 Thanos / Mimir —— **PVC 解决可用性，对象存储才解决持久性**
 
 ---
 
@@ -876,5 +977,10 @@ env:
 | Loki | 128Mi | 512Mi |
 | Promtail | 32Mi | 128Mi |
 | node-exporter | 32Mi | 128Mi |
+| kube-state-metrics | 64Mi | 192Mi |
+| alert-enricher | 48Mi | 192Mi |
+| webhook-relay | 32Mi | 96Mi |
 
-<!-- webhook verified 2026-09-11T10:56:43 -->
+**内存是最硬的约束**：4G 总内存，上面这些 limits 加起来已经接近 2.7G，
+再算上 k3s 自身和 ArgoCD（另一大块），剩下的余量不多 ——
+所以加新组件前必须先 `kubectl top node` 看余量（Istio 尤其要小心）。
