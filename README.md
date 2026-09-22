@@ -948,6 +948,47 @@ kubectl -n kube-system get secret -l sealedsecrets.bitnami.com/sealed-secrets-ke
 | 别被 `hub.docker.com` 超时误导 | 网站 API 返回 000 | 那只是网页 API，**不影响 registry 拉取** |
 | kubeseal 二进制下载被截断 | 5.3MB（正常几十 MB），解压报 `unexpected end of file`，跑起来 `Bus error` | 换国内 GitHub 代理（本例 `ghfast.top` 可用）；**判据用 `tar -tzf` 验证，比看文件大小可靠** |
 
+#### 迁移时的坑：控制器不会"接管"已有的 Secret
+
+第一次部署时三个 Secret 一直没被解开，`status.conditions` 里写着：
+
+```
+failed update: Resource "grafana-admin" already exists and is not managed by SealedSecret
+```
+
+**这是故意的安全设计**：SealedSecret 不覆盖没有归属标签的同名 Secret，
+防止它意外盖掉集群里由别的东西管理的资源。
+代价就是 —— **引入 SealedSecrets 时必须先删掉手工建的 Secret**：
+
+```shell
+kubectl -n monitoring delete secret deepseek-api grafana-admin
+kubectl -n argocd     delete secret webhook-relay-token
+```
+
+**强制重新处理的方式**：`kubectl annotate` **不生效**，日志会打
+`update suppressed, no changes in spec` —— 控制器只在 **spec 变化**时才重建。
+最可靠的是**重启控制器**（启动即全量 resync）：
+
+```shell
+kubectl -n kube-system rollout restart deploy sealed-secrets-controller
+```
+
+成功的日志长这样：
+
+```
+msg="registered private key" secretname=sealed-secrets-key8ppqm
+Event(...reason: 'Unsealed' SealedSecret unsealed successfully
+```
+
+> ⚠️ **这个坑顺带暴露了一个更深的问题**：
+> 那三个 SealedSecret 一直是 `Synced=False`，但表面上什么都没坏 ——
+> 因为手工建的 Secret 一直在顶着。
+> **如果不做"真删一次"这类破坏性验收，永远发现不了控制器其实从来没工作过。**
+>
+> 推而广之：**"资源存在"不等于"资源由正确的东西管理"**。
+> 类似的还有 Service 有 Endpoints 但后端是错的、Pod Running 但业务没起来。
+> 所以 SealedSecret 的 `status.conditions` 值得纳入监控告警。
+
 #### 两个必须知道的边界
 
 1. **命名空间绑定**：SealedSecret 默认 strict scope，密文只在加密时指定的
@@ -1010,7 +1051,10 @@ kubectl -n kube-system get secret -l sealedsecrets.bitnami.com/sealed-secrets-ke
 ### 待做（按推荐顺序）
 
 - [ ] **文档与仓库口径统一** —— 本文件与进度文档互相对齐（进行中）
-- [x] ~~**凭据管理升级到第二级** —— SealedSecrets~~（三个 Secret 已加密进 Git，见踩坑 30）
+- [x] ~~**凭据管理升级到第二级** —— SealedSecrets~~（三个 Secret 已加密进 Git；
+      已实测删除后能自动恢复，见踩坑 30）
+- [ ] **把 SealedSecret 的同步状态纳入告警** —— 它 `Synced=False` 时表面无异常，
+      属于"静默失败"，应该有告警盯着（踩坑 30 最后一段）
 - [ ] **环境重建演练** —— 从 k3s 裸环境恢复整套系统，必须留完整记录
 - [ ] **动态基线推广到内存 / 磁盘**
 - [ ] **CI 与供应链** —— GitHub Actions 构建镜像 + 漏洞扫描 + 不可变 tag/digest
