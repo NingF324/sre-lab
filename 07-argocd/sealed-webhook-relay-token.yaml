@@ -1,0 +1,31 @@
+# webhook relay 的访问令牌 —— 用 SealedSecrets 加密后提交 Git
+#
+# 这个令牌保护的是 webhook 的唯一公网入口（NodePort 30096）。
+# 缺了它 relay 会 fail-closed 拒绝所有请求 —— 所以它是重建环境的必需品，
+# 必须能从 Git 恢复，而不是靠人手一份地记着。
+#
+# ⚠️ 作用域绑定命名空间：这份密文只在 argocd 里能解开。
+#
+# ⚠️ 令牌轮换流程（两边必须同时改）：
+#   1. kubectl -n argocd delete secret webhook-relay-token
+#   2. kubectl -n argocd create secret generic webhook-relay-token \
+#        --from-literal=token="$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 24)"
+#   3. kubectl -n argocd rollout restart deploy webhook-relay
+#   4. 重新加密本文件并在 GitHub 的 webhook 配置里改成同一个新令牌
+#
+# 重新加密的方法见 README 第 30 条。
+
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: webhook-relay-token
+  namespace: argocd
+spec:
+  encryptedData:
+    token: AgCq+ehNLmpz/VyAhlkhwTxVcwbKVG26FEsOt9tAipzL3DD/lPeMib2g0tqMfbCkH7UKSfAoujL+XuCJ/nkCcvHYVa7rDmj4lcxYstMAvsiE7X2K9z++QWzFecF7dbG66eIl+5TVorhI7+MCI5OyBUvgAUZqfvJ6SW69PWLIawsqMC2ahj3geRB5noQ1QcXOkoYu94DHcsdkNXNh5bhOHT6Hqe8I9BNITX6MSxJ57mL3AnKH5T2hCLQtaajvvAsm4tsWDcl+TEA9F6YBsR8Jng07yiXLK5cDl8Jzi+XNbIvt0ANUVbuCWwoM3DUpwYVTbn/OIYfXeoPMZajr7nFgK7diOIN+UDj0XdoW/GvPAiRfSumnrAg36RJZgBS2AVkpfoaN4nhI2TWGBtatMPVhYbmNHfMi7xjVOQGIpKoyDIOLwo1XRMyNyxxtMFxmPr7G5vFssGiqiseCQB1i7SG/7vOl5IGC9oNjoiG1Y0PwA2UfnKa9ktMW8MkAyFDhdgVB8kqhOr+LrF8D39Ad/Spmwib1ALt0TKJV+SkMwBJvy3osBsYduh8QzyqnFB7LZAy3SrLyHPln8oU/iA3NXoTcvATV7tQX/jtgNFZmRmhvadu+4OcwGTYBUcQRjTTYgqJA6B/UX2JE0DdiarPg2xMDKyp70Bfp8P2aP+VveM0wwf1V2f2mm3pUErNazETL0HpwIpM/XE8me6IimqSc9fZxr7xK/zXlwc6gUxo=
+  template:
+    metadata:
+      name: webhook-relay-token
+      namespace: argocd
+    type: Opaque

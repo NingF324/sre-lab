@@ -153,10 +153,13 @@ kubectl apply -f 06-gitops/root-app.yaml
 四个子 Application，它们再各自同步自己负责的目录 —— 这就是 **App-of-Apps 模式**。
 新增组件只需往 `apps/` 里加一个文件，根应用自动发现。
 
-> ⚠️ **但"三步重建"目前还缺一步**：三个 Secret（`deepseek-api` / `grafana-admin` /
-> `webhook-relay-token`）是手工 `kubectl create` 的，不在 Git 里。
-> 重建时必须先建它们，否则 Prometheus 之外的若干 Pod 会起不来。
-> **这是重建演练（P3）的头号阻塞点**，也是要上 SealedSecrets（P2）的原因。
+> ⚠️ **"三步重建"之外还有两个 bootstrap 步骤**（都在 Git 之外，见踩坑 30）：
+>
+> 1. 安装 sealed-secrets 控制器：`kubectl apply -f controller.yaml`
+> 2. **恢复主密钥**：`kubectl apply -f sealed-secrets-master-key.yaml`
+>    —— **不做这一步，Git 里所有密文都解不开**
+>
+> 做完这两步，三个 Secret 就会由 ArgoCD 从 Git 自动恢复出来。
 
 ### ArgoCD 说明
 
@@ -898,6 +901,62 @@ env:
    低负载机器上固定阈值几乎永不触发，而"平时 2% 跳到 15%"这种
    业务上的真实异常，只有动态基线能覆盖。
 
+### 30. SealedSecrets：把"密钥存哪"转移了，但没有消灭它
+
+**要解决的问题**：Secret 不能明文进 Git，但重建环境又必须能从 Git 恢复。
+两者矛盾，所以需要一个"密文可以公开、只有集群能解开"的机制。
+
+**做法**：控制器持有一对 RSA 密钥。
+`kubeseal` 用公钥加密 → 密文提交 Git → 控制器用私钥解密成真正的 Secret。
+
+```
+明文 Secret ──kubeseal+公钥──▶ SealedSecret(密文) ──git push──▶ 仓库
+                                                                  │
+                                                          ArgoCD 同步
+                                                                  ▼
+                            集群内 Secret ◀──控制器用私钥解密── SealedSecret(密文)
+```
+
+**但有个关键前提：主密钥必须自己备份。**
+
+> SealedSecrets 把"3 个 Secret 要存哪"变成了"1 把主密钥要存哪" ——
+> **问题规模小了，但没有消失。**
+> 主密钥一丢，Git 里所有密文都变成永远解不开的垃圾。
+
+备份（**绝不进 Git**，存密码管理器）：
+
+```shell
+kubectl -n kube-system get secret -l sealedsecrets.bitnami.com/sealed-secrets-key -o yaml \
+  > sealed-secrets-master-key.yaml
+```
+
+**重建环境的正确顺序**（顺序错了密文就解不开）：
+
+1. 装控制器 `kubectl apply -f controller.yaml`
+2. **先恢复主密钥**，再删掉控制器自动生成的那把：
+   ```shell
+   kubectl apply -f sealed-secrets-master-key.yaml
+   kubectl -n kube-system rollout restart deploy sealed-secrets-controller
+   ```
+3. 最后让 ArgoCD 同步 SealedSecret 文件
+
+#### 安装时踩的三个坑
+
+| 坑 | 现象 | 解法 |
+|---|---|---|
+| 镜像不在 quay.io 了 | `quay.io/bitnami/sealed-secrets-controller` 返回 **401**（能连通但仓库不可用） | 官方 `controller.yaml` 已改用 `docker.io/bitnami/sealed-secrets-controller:0.40.0`，**Docker Hub 反而有加速** |
+| 别被 `hub.docker.com` 超时误导 | 网站 API 返回 000 | 那只是网页 API，**不影响 registry 拉取** |
+| kubeseal 二进制下载被截断 | 5.3MB（正常几十 MB），解压报 `unexpected end of file`，跑起来 `Bus error` | 换国内 GitHub 代理（本例 `ghfast.top` 可用）；**判据用 `tar -tzf` 验证，比看文件大小可靠** |
+
+#### 两个必须知道的边界
+
+1. **命名空间绑定**：SealedSecret 默认 strict scope，密文只在加密时指定的
+   namespace 里能解开 —— 防的是"拿到密文换个地方用"。
+   **换 namespace 就必须重新加密**（改 `openssl`/`yq` 拼密文没用）。
+2. **它防的是"仓库泄露"，不防"集群被入侵"**：
+   任何能在集群里读 Secret 的人，照样能拿到明文。
+   SealedSecrets 解决的是**分发**问题，不是**运行时保护**问题。
+
 ---
 
 ## 已知限制
@@ -915,10 +974,11 @@ env:
 
   ⚠️ **local-path 默认 `allowVolumeExpansion=false`，卷不能在线扩容**，
   初次申请要留足余量，真满了只能重建 PVC 再导数据。生产应换云盘 CSI 并开启扩容。
-- **Secret 仍需手工创建，是重建的头号阻塞点**：`deepseek-api` / `grafana-admin` /
-  `webhook-relay-token` 都不在 Git 里（密码不能明文进仓库）。
-  这意味着"从零重建三步走"目前**跑不通**，必须补手工步骤。
-  解法是 SealedSecrets / External Secrets（列为下一步 P2）。
+- ~~**Secret 仍需手工创建**~~ → **已解决**：三个 Secret 已用 SealedSecrets 加密后进 Git
+  （`10-platform/sealed-*.yaml`、`07-argocd/sealed-*.yaml`）。见踩坑 30。
+- **主密钥需要人工备份，仍是重建的必经人工步骤**：SealedSecrets 把问题从
+  "3 个 Secret"缩小到"1 把主密钥"，但它仍然不在 Git 里（也不该在）。
+  重建时必须先手动恢复主密钥，否则 Git 里的密文解不开。
 - **kube-state-metrics 当前只采集四类对象**：Deployment / ReplicaSet / Pod / Node。
   StatefulSet、Job 等对象暂未启用，需要时同步扩展 `--resources` 和 RBAC。
 - **Promtail 用静态采集**：见踩坑 9。
@@ -950,7 +1010,7 @@ env:
 ### 待做（按推荐顺序）
 
 - [ ] **文档与仓库口径统一** —— 本文件与进度文档互相对齐（进行中）
-- [ ] **凭据管理升级到第二级** —— SealedSecrets，让加密后的 Secret 也能进 Git
+- [x] ~~**凭据管理升级到第二级** —— SealedSecrets~~（三个 Secret 已加密进 Git，见踩坑 30）
 - [ ] **环境重建演练** —— 从 k3s 裸环境恢复整套系统，必须留完整记录
 - [ ] **动态基线推广到内存 / 磁盘**
 - [ ] **CI 与供应链** —— GitHub Actions 构建镜像 + 漏洞扫描 + 不可变 tag/digest

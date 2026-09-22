@@ -1,0 +1,30 @@
+# DeepSeek API Key —— 用 SealedSecrets 加密后提交 Git
+#
+# 这个文件里是密文，可以放心公开。解密需要 kube-system 里
+# sealed-secrets-controller 持有的那把主密钥（sealedsecrets.bitnami.com/sealed-secrets-key）。
+#
+# ⚠️ 三条必须记住的约束：
+#   1. 作用域绑定命名空间（默认 strict）—— 这份密文只在 monitoring 里能解开，
+#      换到别的 namespace 直接失效。防的是"拿到密文换个地方用"。
+#   2. 使用方引用的是 secretKeyRef，用的是 key 名 `api-key`，改 key 名要重新加密。
+#   3. **主密钥丢了这份密文就永远解不开**。重建环境时必须先恢复主密钥，
+#      再让 ArgoCD 同步本文件。主密钥的备份见 README 第 30 条。
+#
+# 重新加密的方法（明文不进终端）：
+#   kubectl -n monitoring get secret deepseek-api -o yaml \
+#     | kubeseal --cert <公钥证书> --format yaml > sealed-deepseek-api.yaml
+
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: deepseek-api
+  namespace: monitoring
+spec:
+  encryptedData:
+    api-key: AgBZlvEP2DCJw/v1wWNB905y2oMDL84Es8h2WtnII+VMbQllG5d1zaLzOljuXmI5F9vjs84EcpFQBd4VTpPJeqaTUyQsoCfS0LPOo+Mlvn9z3EyeySCWFtsXeSh7dZz5k8oMFR7PfJggStq7pAcmag3+0oi0JXN05Lv+jt9t5eafHYadIEQQKYN1rGiSfBSHdCBBdMetzRg4dEvzYhah3KmtGO9aYW3ma80OlQQm+HHiNlDP6vHlKJkb0hJtxL0/O20YY87ziMH7jA2CTHV+Bq4URrdfo7wpwFWW4LT2doRT9tAYYYwIYzuOf1KXHlZ+tdU+KLS1BecBtUzdYpUn6K1hc8v3ltstTgZsCEvL6sHgOSQk1vXCxQdbEkHeCt4J5SCtoto058DpYzTJARLEup8pIjNoEHQWPZRzffPclIGY15cjR/jvsaGp4PVVNbmw7TE54xQvUpmgr9zyVSYlO0StBzs200ywK55LR9OP8jUmhGfWcItmslObEGyImQXSoYaVdedX+KgxF5XLg1jD+IrFR2EFzOnJJ9yn+RF4p4DvVM7BqZNNChJtoQ1xNGpO/ze3ydYJv+BB2sSt0QHfKjyKypr3Su8NEYfA3SDY19qeCDQqf4fg6NQ1b6ha9/w2TZZ3ojZz3LYQcf4rPYHZcBcbvpB2yHFZmCeCeqoUKSmTS/qie/zXXzIGPEjgJDU/oTvH523EbqF6SQeU96+jK5U+cqx9U4WKRx0wdjXOPsaagtQ1HQ==
+  template:
+    metadata:
+      name: deepseek-api
+      namespace: monitoring
+    type: Opaque

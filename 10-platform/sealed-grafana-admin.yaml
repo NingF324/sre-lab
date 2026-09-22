@@ -1,0 +1,30 @@
+# Grafana 管理密码 —— 用 SealedSecrets 加密后提交 Git
+#
+# 背景：这个密码原先明文写在 monitoring.yaml 里（`value: "admin123"`），
+# 而仓库是 public 的 —— 等于把管理密码对全世界公开。见 README 第 28 条。
+#
+# 现在分两层：
+#   1. monitoring.yaml 里只留 secretKeyRef，密码不进 Git；
+#   2. 密文放这里，明文只存在于已经被 SealedSecrets 解密出来的集群内 Secret 里。
+#
+# ⚠️ 注意：Grafana 首次启动会把密码写进 grafana.db，之后改环境变量无效。
+# 本文件只保证"全新的 Grafana 实例能拿到正确密码"。
+# 存量实例改密码要用：
+#   kubectl -n monitoring exec deploy/grafana -- grafana cli admin reset-admin-password '<新密码>'
+#
+# 重新加密的方法见 README 第 30 条。
+
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: grafana-admin
+  namespace: monitoring
+spec:
+  encryptedData:
+    password: AgCu3MXXMuE57ZyOzNYn9xYGGeoYDUJbZncR1W0JIoY8HKlcYorPqTjjb/Hk1/OMdWVmXA5l+W10hUrX/Y69zsIWTs4jwG1D7DGlNAmewjCdCSrqATJMnR8PaBYp9FbXCMEET22d1kjRp2rHGW4yfF2aUT0MforI7jBY8iSnO4t1/zaYDNTC7T7PebGF5LHqCR0fu54Lcxi9DtQz2FrIsfaUVoswmomoL1QQ3C63920rgPOoBxsY93oUCGIF2kuSR3fv9i2/QlDXoWxKbtcmX2y3O0D57RItYHouR96BVxpLaTtUdhwemBh6tvYYtKzVWlphWvMW06sBPKXhQ2MaCDugNozYIUeD5ENkNRnw/5fQEA0TF9oZhPL3d0pqddVVWJ9SVTib7xd7nn3EmC11x3gJ7Pr0Emmx69cwNPk3xm6HkD1/WAZXiKAHxsviaPAc1EmEhByluYKtdvSavp+tT+CwKaMog94wAgtgJaiwiwtwAn27nV2SBU3piW2Asvd90ZNjETRqRUWqG6d4XBnAX8X22KCGeRx45l2n/MRzvVbfDcx9MaZHh8L2UvqV3thfc0ZEjYFlWIeqqvDRp8QffG0vl75Rvx1uimK6124Sb1w0uNsaFHUT5+uppz86soiBsYQjJCSnTpJPC82La565Lp3egSX/5ZugX5w176TjnXKqxap7F2IHaGm6tfROzN8IaP8vOuvHQaQkSpjILT9GTuiG
+  template:
+    metadata:
+      name: grafana-admin
+      namespace: monitoring
+    type: Opaque
